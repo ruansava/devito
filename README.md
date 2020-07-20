@@ -66,4 +66,7 @@ As of YASK:
 this section, we [arbitrarily] use the term "block" for spatial-only grouping
 and "tile" when multiple temporal updates are allowed.`
 
-Let me know your findings and your performance results.
+Let me know your findings and your performance results. https://opesci-slackin.now.sh/ at #time-tiling
+
+Depending on platform, I would expect speed-ups along the following lines:
+![Perf results](https://github.com/devitocodes/devito/blob/timetiling_on_cd/examples/seismic/acoustic/kernels/temporal_performance.pdf)
