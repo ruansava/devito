@@ -1,133 +1,69 @@
-# Devito: Fast Stencil Computation from Symbolic Specification
+# The wavefront temporal blocking rabbit-hole
 
-[![Build Status for the Core backend](https://github.com/devitocodes/devito/workflows/CI-core/badge.svg)](https://github.com/devitocodes/devito/actions?query=workflow%3ACI-core)
-[![Build Status with MPI](https://github.com/devitocodes/devito/workflows/CI-mpi/badge.svg)](https://github.com/devitocodes/devito/actions?query=workflow%3ACI-mpi)
-[![Build Status on GPU](https://github.com/devitocodes/devito/workflows/CI-gpu/badge.svg)](https://github.com/devitocodes/devito/actions?query=workflow%3ACI-gpu)
-[![Code Coverage](https://codecov.io/gh/devitocodes/devito/branch/master/graph/badge.svg)](https://codecov.io/gh/devitocodes/devito)
-[![Slack Status](https://img.shields.io/badge/chat-on%20slack-%2336C5F0)](https://opesci-slackin.now.sh)
-[![asv](http://img.shields.io/badge/benchmarked%20by-asv-blue.svg?style=flat)](https://devitocodes.github.io/devito-performance)
-[![PyPI version](https://badge.fury.io/py/devito.svg)](https://badge.fury.io/py/devito)
-[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/devitocodes/devito/master)
+# Prerequisites:
+  - A working devito installation https://www.devitoproject.org/devito/download.html
+  - 
+  
+# Steps:
 
-[Devito](http://www.devitoproject.org) is a Python package to implement
-optimized stencil computation (e.g., finite differences, image processing,
-machine learning) from high-level symbolic problem definitions.  Devito builds
-on [SymPy](http://www.sympy.org/en/index.html) and employs automated code
-generation and just-in-time compilation to execute optimized computational
-kernels on several computer platforms, including CPUs, GPUs, and clusters
-thereof.
+  - `cd devito`
+  - `git checkout timetiling_on_cd`
+  - Set env variables and pinning.
+DEVITO_LANGUAGE=openmp
+OMP_PROC_BIND=?
+DEVITO_LOGGING=DEBUG
 
-- [About Devito](#about-devito)
-- [Installation](#installation)
-- [Resources](#resources)
-- [Performance](#performance)
-- [Get in touch](#get-in-touch)
-- [Interactive jupyter notebooks](#interactive-jupyter-notebooks)
+  - Run `DEVITO_JIT_BACKDOOR=0 python3 examples/seismic/acoustic/demo_temporal_sources.py -so 4` 
+  This will generate code for a space order 4 acoustic devito kernel and another kernel that we will modify.
+  You will notice difference between `norm(usol)` and `norm(uref)`. This is expected. Ignore that for now.
+The generated log will end executing a kernel under `===Temporal blocking================================`
 
-## About Devito
-
-Devito provides a functional language to implement sophisticated operators that
-can be made up of multiple stencil computations, boundary conditions, sparse
-operations (e.g., interpolation), and much more.  A typical use case is
-explicit finite difference methods for approximating partial differential
-equations. For example, a 2D diffusion operator may be implemented with Devito
-as follows
-
-```python
->>> grid = Grid(shape=(10, 10))
->>> f = TimeFunction(name='f', grid=grid, space_order=2)
->>> eqn = Eq(f.dt, 0.5 * f.laplace)
->>> op = Operator(Eq(f.forward, solve(eqn, f.forward)))
+```
+===Temporal blocking======================================
+Allocating memory for n(1,)
+Allocating memory for usol(3, 236, 236, 236)
+gcc -O3 -g -fPIC -Wall -std=c99 -march=native -Wno-unused-result -Wno-unused-variable -Wno-unused-but-set-variable -ffast-math -shared -fopenmp /tmp/devito-jitcache-uid1000/xxx-hash-xxx.c -lm -o /tmp/devito-jitcache-uid1000/xxx-hash-xxx.so
+Operator `Kernel` jit-compiled `/tmp/devito-jitcache-uid1000/xxx-hash-xxx.c` in 0.48 s with `GNUCompiler`
+Operator `Kernel` run in 0.49 s
 ```
 
-An `Operator` generates low-level code from an ordered collection of `Eq` (the
-example above being for a single equation). This code may also be compiled and
-executed
+Copy the space order 4 kernel from `devito/examples/seismic/acoustic/kernels/` to the `xxx-hash-xxx.c`
+`cp kernels/kernel_so8_acoustic.c /tmp/devito-jitcache-uid1000/d3cee7726ce639b303537a387aa51cd42d9feecd.c`
 
-```python
->>> op(t=timesteps)
+Then try `DEVITO_JIT_BACKDOOR=1 python3 examples/seismic/acoustic/demo_temporal_sources.py -so 4`
+to re-run. Now the norms should match. If not contact me ASAP :-).
+
+Use arguments `-d nx ny nx` , `-tn timesteps` to pass as arguments domain size and number of timesteps.
+e.g.:
+`DEVITO_JIT_BACKDOOR=1 python3 examples/seismic/acoustic/demo_temporal_sources.py -d 200 200 200 --tn 100 -so 8`
+
+There exist available kernels for space orders 4, 8, 12.
+
+# Tuning Devito
+Run Devito with `DEVITO_LOGGING=aggressive` so as to ensure that one of the best space-blocking configurations are selected.
+
+# Tuning time-tiled kernel
+In order to manually tune the Devito time-tiled kernel one should use an editor and jit-backdoor.
+You can and should manually play around tile and block size values.
 ```
-
-There is virtually no limit to the complexity of an `Operator` -- the Devito
-compiler will automatically analyze the input, detect and apply optimizations
-(including single- and multi-node parallelism), and eventually generate code
-with suitable loops and expressions.
-
-Key features include:
-
-* A functional language to express finite difference operators.
-* Straightforward mechanisms to adjust the discretization.
-* Constructs to express sparse operators (e.g., interpolation), classic linear
-  operators (e.g., convolutions), and tensor contractions.
-* Seamless support for boundary conditions and adjoint operators.
-* A flexible API to define custom stencils, sub-domains, sub-sampling,
-  and staggered grids.
-* Generation of highly optimized parallel code (SIMD vectorization, CPU and GPU
-  parallelism via OpenMP, multi-node parallelism via MPI, blocking, aggressive
-  symbolic transformations for FLOP reduction, etc.).
-* Distributed NumPy arrays over multi-node (MPI) domain decompositions.
-* Inspection and customization of the generated code.
-* Autotuning framework to ease performance tuning.
-* Smooth integration with popular Python packages such as NumPy, SymPy, Dask,
-  and SciPy, as well as machine learning frameworks such as TensorFlow and
-  PyTorch.
-
-## Installation
-
-The easiest way to try Devito is through Docker using the following commands:
+  int xb_size = 32;
+  int yb_size = 32; // to fix as 8/16 etc
+  int num_threads = 8;
+  int x0_blk0_size = 8;
+  int y0_blk0_size = 8;
 ```
-# get the code
-git clone https://github.com/devitocodes/devito.git
-cd devito
+You should also change accordingly the number of threads manually.
+According to experiments x0_blk0_size, y0_blk0_size are best at 8
+while xb_size, yb_size are nice in {32, 48, 64} depending on the platform.
 
-# start a jupyter notebook server on port 8888
-docker-compose up devito
-```
-After running the last command above, the terminal will display a URL such as
-`https://127.0.0.1:8888/?token=XXX`. Copy-paste this URL into a browser window
-to start a [Jupyter](https://jupyter.org/) notebook session where you can go
-through the [tutorials](https://github.com/devitocodes/devito/tree/master/examples)
-provided with Devito or create your own notebooks.
+`xb_size, yb_size == tiles`
+`x0_blk0_size, y0_blk0_size == blocks`
 
-[See here](http://devitocodes.github.io/devito/download.html) for detailed installation
-instructions and other options. If you encounter a problem during installation, please
-see the
-[installation issues](https://github.com/devitocodes/devito/wiki/Installation-Issues) we
-have seen in the past. 
+When on Skylake: you may also need to change SIMD parallelism from 32 to 64.
 
-## Resources
+As of YASK:
+`From YASK: Although the terms "block" and "tile" are often used interchangeably, in
+this section, we [arbitrarily] use the term "block" for spatial-only grouping
+and "tile" when multiple temporal updates are allowed.`
 
-To learn how to use Devito,
-[here](https://github.com/devitocodes/devito/blob/master/examples) is a good
-place to start, with lots of examples and tutorials.
-
-The [website](https://www.devitoproject.org/) also provides access to other
-information, including documentation and instructions for citing us.
-
-Some FAQ are discussed [here](https://github.com/devitocodes/devito/wiki/FAQ).
-
-## Performance
-
-If you are interested in any of the following
-
-* Generation of parallel code (CPU, GPU, multi-node via MPI);
-* Performance tuning;
-* Benchmarking operators;
-
-then you should take a look at this
-[README](https://github.com/devitocodes/devito/blob/master/benchmarks/user).
-
-You may also be interested in
-[TheMatrix](https://github.com/devitocodes/thematrix) -- a cross-architecture
-benchmarking framework showing the performance of several production-grade
-seismic operators implemented with Devito. This is now our flagship project
-towards neat, open, and reproducible science.
-
-## Get in touch
-
-If you're using Devito, we would like to hear from you. Whether you
-are facing issues or just trying it out, join the
-[conversation](https://opesci-slackin.now.sh).
-
-## Interactive jupyter notebooks
-The tutorial jupyter notebook are available interactively at the public [binder](https://mybinder.org/v2/gh/devitocodes/devito/master) jupyterhub. 
+Let me know your findings and your performance results.
