@@ -1,3 +1,4 @@
+from collections import defaultdict
 from functools import partial, singledispatch
 
 import cgen as c
@@ -6,7 +7,9 @@ import numpy as np
 from devito.core.operator import OperatorCore
 from devito.data import FULL
 from devito.exceptions import InvalidOperator
-from devito.ir.iet import Callable, ElementalFunction, MapExprStmts
+from devito.ir.iet import (Callable, ElementalFunction, Expression, Iteration,
+                           FindNodes, FindSymbols, MapExprStmts, MapNodes, Transformer)
+from devito.ir.support import Scope
 from devito.logger import warning
 from devito.mpi.routines import CopyBuffer, SendRecv, HaloUpdate
 from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_increments,
@@ -14,10 +17,19 @@ from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_i
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
-from devito.tools import as_tuple, filter_sorted, timed_pass
+from devito.tools import as_tuple, filter_sorted, split, timed_pass
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
+
+
+class HostOpenMPIteration(OpenMPIteration):
+
+    @classmethod
+    def _make_header(cls, **kwargs):
+        pragmas, kwargs = super()._make_header(**kwargs)
+        pragmas = as_tuple(kwargs.pop('onhost', None)) + pragmas
+        return pragmas, kwargs
 
 
 class DeviceOpenMPIteration(OpenMPIteration):
@@ -42,6 +54,8 @@ class DeviceOmpizer(Ompizer):
             c.Pragma('omp target enter data map(alloc: %s%s)' % (i, j)),
         'map-update': lambda i, j:
             c.Pragma('omp target update from(%s%s)' % (i, j)),
+        'map-update-host': lambda i, j:
+            c.Pragma('omp target update from(%s%s)' % (i, j)),
         'map-release': lambda i, j:
             c.Pragma('omp target exit data map(release: %s%s)' % (i, j)),
         'map-exit-delete': lambda i, j:
@@ -49,6 +63,11 @@ class DeviceOmpizer(Ompizer):
     })
 
     _Iteration = DeviceOpenMPIteration
+    _HostIteration = HostOpenMPIteration
+
+    def __init__(self, sregistry, options, key=None):
+        super().__init__(sregistry, options, key=key)
+        self.device_fit = options['device-fit']
 
     @classmethod
     def _map_data(cls, f):
@@ -75,6 +94,11 @@ class DeviceOmpizer(Ompizer):
     def _map_update(cls, f):
         return cls.lang['map-update'](f.name, ''.join('[0:%s]' % i
                                                       for i in cls._map_data(f)))
+
+    @classmethod
+    def _map_update_host(cls, f):
+        return cls.lang['map-update-host'](f.name, ''.join('[0:%s]' % i
+                                                           for i in cls._map_data(f)))
 
     @classmethod
     def _map_release(cls, f):
@@ -106,9 +130,16 @@ class DeviceOmpizer(Ompizer):
         collapsable = self._find_collapsable(root, candidates)
         ncollapse = 1 + len(collapsable)
 
-        # Prepare to build a ParallelTree
-        # Create a ParallelTree
-        body = self._Iteration(ncollapse=ncollapse, **root.args)
+        functions = FindSymbols().visit(root)
+        if all(is_ondevice(f, self.device_fit) for f in functions):
+            # The typical case: all accessed Function's are device Function's, that is
+            # all Function's are in the device memory. Then we offload the candidate
+            # Iterations to the device
+            body = self._Iteration(ncollapse=ncollapse, **root.args)
+        else:
+            # Some Function's are on the host, then we parallelize the Iteration tree
+            # on the host
+            body = self._HostIteration(ncollapse=ncollapse, **root.args)
         partree = ParallelTree([], body, nthreads=nthreads)
 
         collapsed = [partree] + collapsable
@@ -131,6 +162,24 @@ class DeviceOmpizer(Ompizer):
 class DeviceOpenMPDataManager(DataManager):
 
     _Parallelizer = DeviceOmpizer
+
+    def __init__(self, sregistry, options):
+        """ 
+        Parameters
+        ----------
+        sregistry : SymbolRegistry
+            The symbol registry, to quickly access the special symbols that may
+            appear in the IET (e.g., `sregistry.threadid`, that is the thread
+            Dimension, used by the DataManager for parallel memory allocation).
+        options : dict
+            The optimization options.
+            Accepted: ['device-fit'].
+            * 'device-fit': an iterable of `Function`s that are guaranteed to fit
+              in the device memory. By default, all `Function`s except saved
+              `TimeFunction`'s are assumed to fit in the device memory.
+        """
+        super().__init__(sregistry)
+        self.device_fit = options['device-fit']
 
     def _alloc_array_on_high_bw_mem(self, site, obj, storage):
         _storage = Storage()
@@ -155,7 +204,7 @@ class DeviceOpenMPDataManager(DataManager):
         storage.update(obj, site, allocs=alloc, frees=free)
 
     @iet_pass
-    def place_ondevice(self, iet, **kwargs):
+    def place_ondevice(self, iet):
 
         @singledispatch
         def _place_ondevice(iet):
@@ -180,9 +229,11 @@ class DeviceOpenMPDataManager(DataManager):
             # Populate `storage`
             storage = Storage()
             for i in filter_sorted(writes):
-                self._map_function_on_high_bw_mem(iet, i, storage)
+                if is_ondevice(i, self.device_fit):
+                    self._map_function_on_high_bw_mem(iet, i, storage)
             for i in filter_sorted(reads):
-                self._map_function_on_high_bw_mem(iet, i, storage, read_only=True)
+                if is_ondevice(i, self.device_fit):
+                    self._map_function_on_high_bw_mem(iet, i, storage, read_only=True)
 
             iet = self._dump_storage(iet, storage)
 
@@ -199,6 +250,35 @@ class DeviceOpenMPDataManager(DataManager):
             return iet
 
         iet = _place_ondevice(iet)
+
+        return iet, {}
+
+    @iet_pass
+    def place_onhost(self, iet):
+        device_fit = self.device_fit
+
+        # Analysis
+        mapper = defaultdict(set)
+        visitor = MapNodes(Iteration, self._Parallelizer._HostIteration, 'immediate')
+        for k, v in visitor.visit(iet).items():
+            #TODO: Check with test where len(ih) > 1
+
+            scope = Scope([e.expr for e in FindNodes(Expression).visit(k)])
+            for i in v:
+                ondevice, onhost = split(FindSymbols().visit(i),
+                                         lambda f: is_ondevice(f, self.device_fit))
+                for f in ondevice:
+                    if any(dep.function is f for dep in scope.d_all_gen()):
+                        mapper[i].add(f)
+
+        # Post-process analysis
+        for k, v in list(mapper.items()):
+            onhost = [self._Parallelizer._map_update_host(f) for f in v]
+            mapper[k] = k._rebuild(onhost=onhost)
+
+        # Transform the IET adding pragmas to written data back to the host
+        iet = Transformer(mapper, nested=True).visit(iet)
+        from IPython import embed; embed()
 
         return iet, {}
 
@@ -267,6 +347,9 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         o['par-dynamic-work'] = np.inf  # Always use static scheduling
         o['par-nested'] = np.inf  # Never use nested parallelism
 
+        # GPU data
+        o['device-fit'] = as_tuple(oo.pop('device-fit', None))
+
         if oo:
             raise InvalidOperator("Unsupported optimization options: [%s]"
                                   % ", ".join(list(oo)))
@@ -319,8 +402,9 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         DeviceOmpizer(sregistry, options).make_parallel(graph)
 
         # Symbol definitions
-        data_manager = DeviceOpenMPDataManager(sregistry)
+        data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
+        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -347,8 +431,9 @@ class DeviceOpenMPOperator(DeviceOpenMPNoopOperator):
         hoist_prodders(graph)
 
         # Symbol definitions
-        data_manager = DeviceOpenMPDataManager(sregistry)
+        data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
+        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -415,9 +500,21 @@ class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
             passes_mapper['openmp'](graph)
 
         # Symbol definitions
-        data_manager = DeviceOpenMPDataManager(sregistry)
+        data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
+        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
         return graph
+
+
+# Utils
+
+def is_ondevice(f, device_fit):
+    """
+    True if `f` is allocated in the device memory, False otherwise.
+    """
+    return not (f.is_TimeFunction and
+                f.save is not None and
+                f not in device_fit)
