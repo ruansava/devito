@@ -5,6 +5,7 @@ from .lazy import *  # noqa
 
 # Needed both within and outside Devito
 from .dimension import *  # noqa
+from .customcall import *  # noqa
 from .utils import *  # noqa
 from .caching import _SymbolCache, CacheManager  # noqa
 
