@@ -25,6 +25,8 @@
     * `cire-repeats-inv` (int, 1): control detection of dimension-invariants
     * `cire-mincost-inv` (int, 50): minimum cost of a dimension-invariant candidate
     * `cire-onstack` (boolean, False): control scope of temporary arrays (on the heap by default)
+  * Device-specific:
+    * `device-fit` (boolean, False): control movement of saved TimeFunctions between host and device
 
 ### Optimization parameters by platform
 
@@ -58,3 +60,9 @@
 | cire-repeats-inv    | :heavy_check_mark:  | :heavy_check_mark: |
 | cire-mincost-inv    | :heavy_check_mark:  | :heavy_check_mark: |
 | cire-onstack        | :heavy_check_mark:  |         :x:        |
+
+* Device-specific
+
+|                     |        CPU          |         GPU        |
+|---------------------|---------------------|--------------------|
+| device-fit          |        :x:          | :heavy_check_mark: |
