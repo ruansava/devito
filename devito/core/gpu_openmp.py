@@ -104,9 +104,16 @@ class DeviceOmpizer(Ompizer):
                                                       for i in cls._map_data(f)))
 
     @classmethod
-    def _map_update_host(cls, f):
-        return cls.lang['map-update-host'](f.name, ''.join('[0:%s]' % i
-                                                           for i in cls._map_data(f)))
+    def _map_update_host(cls, f, datamap):
+        datasize = cls._map_data(f)
+        assert len(datamap) == len(datasize)
+        ranges = []
+        for i, j in zip(datamap, datasize):
+            if i is FULL:
+                ranges.append('[0:%s]' % j)
+            else:
+                ranges.append('[%s]' % i)
+        return cls.lang['map-update-host'](f.name, ''.join(ranges))
 
     @classmethod
     def _map_release(cls, f):
@@ -275,22 +282,31 @@ class DeviceOpenMPDataManager(DataManager):
 
             scope = Scope([e.expr for e in FindNodes(Expression).visit(k)])
             for i in v:
-                ondevice, onhost = split(FindSymbols().visit(i),
-                                         lambda f: is_ondevice(f, self.device_fit))
-                for f in ondevice:
-                    if any(dep.function is f for dep in scope.d_all_gen()):
-                        mapper[i].add(f)
+                ondevice, onhost = split(FindSymbols('indexeds').visit(i),
+                                         lambda i: is_ondevice(i, self.device_fit))
+                for indexed in ondevice:
+                    f = indexed.function
+                    assert i.dim in f.dimensions
+                    if f.is_DiscreteFunction and f in scope.writes:
+                        n = f.dimensions.index(i.dim)
+                        datamap = [idx for idx in indexed.indices[:n]]
+                        datamap.extend([FULL for _ in indexed.indices[n:]])
+                        mapper[i].add((f, tuple(datamap)))
 
         # Post-process analysis
         for k, v in list(mapper.items()):
-            onhost = [self._Parallelizer._map_update_host(f) for f in v]
+            onhost = [self._Parallelizer._map_update_host(f, dm) for f, dm in v]
             mapper[k] = k._rebuild(onhost=onhost)
 
-        # Transform the IET adding pragmas to written data back to the host
-        iet = Transformer(mapper, nested=True).visit(iet)
+        # We also gonna execute the Iteration via a C++ parloop on the host
+        parallel_for = make_host_parallel_for()
         from IPython import embed; embed()
 
-        return iet, {}
+        # Transform the IET adding pragmas triggering a copy of the written data
+        # back to the host
+        iet = Transformer(mapper, nested=True).visit(iet)
+
+        return iet, {'efuncs': parallel_for}
 
 
 @iet_pass
@@ -612,6 +628,11 @@ def is_ondevice(f, device_fit):
     """
     True if `f` is allocated in the device memory, False otherwise.
     """
+    f = f.function  # `f` may be an Indexed or an actual Function
     return not (f.is_TimeFunction and
                 f.save is not None and
                 f not in device_fit)
+
+
+def make_host_parallel_for():
+    pass
