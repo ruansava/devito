@@ -3,7 +3,8 @@ from functools import partial, singledispatch
 import cgen as c
 
 from devito.core.gpu_openmp import (DeviceOpenMPNoopOperator, DeviceOpenMPIteration,
-                                    DeviceOmpizer, DeviceOpenMPDataManager)
+                                    HostOpenMPIteration, DeviceOmpizer,
+                                    DeviceOpenMPDataManager, is_ondevice)
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import Call, ElementalFunction, FindSymbols, List, LocalExpression
@@ -23,6 +24,19 @@ __all__ = ['DeviceOpenACCNoopOperator', 'DeviceOpenACCOperator',
 # abstract things away so as to have a separate, language-agnostic superclass
 
 
+class HostOpenACCIteration(HostOpenMPIteration):
+
+    @classmethod
+    def _make_construct(cls, **kwargs):
+        return 'acc parallel loop self'
+
+    @classmethod
+    def _make_clauses(cls, **kwargs):
+        #kwargs['chunk_size'] = False
+        #TODO: ASYNC??
+        return super()._make_clauses(**kwargs)
+
+
 class DeviceOpenACCIteration(DeviceOpenMPIteration):
 
     @classmethod
@@ -32,7 +46,7 @@ class DeviceOpenACCIteration(DeviceOpenMPIteration):
     @classmethod
     def _make_clauses(cls, **kwargs):
         kwargs['chunk_size'] = False
-        clauses = super(DeviceOpenACCIteration, cls)._make_clauses(**kwargs)
+        clauses = super()._make_clauses(**kwargs)
 
         partree = kwargs['nodes']
         deviceptrs = [i.name for i in FindSymbols().visit(partree) if i.is_Array]
@@ -54,6 +68,8 @@ class DeviceAccizer(DeviceOmpizer):
             c.Pragma('acc data present(%s%s)' % (i, j)),
         'map-update': lambda i, j:
             c.Pragma('acc exit data copyout(%s%s)' % (i, j)),
+        'map-update-host': lambda i, j:
+            c.Pragma('acc update self(%s%s)' % (i, j)),
         'map-release': lambda i, j:
             c.Pragma('acc exit data delete(%s%s)' % (i, j)),
         'map-exit-delete': lambda i, j:
@@ -63,6 +79,7 @@ class DeviceAccizer(DeviceOmpizer):
     }
 
     _Iteration = DeviceOpenACCIteration
+    _HostIteration = HostOpenACCIteration
 
     @classmethod
     def _map_present(cls, f):
@@ -178,8 +195,9 @@ class DeviceOpenACCNoopOperator(DeviceOpenMPNoopOperator):
         DeviceAccizer(sregistry, options).make_parallel(graph)
 
         # Symbol definitions
-        data_manager = DeviceOpenACCDataManager(sregistry)
+        data_manager = DeviceOpenACCDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
+        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -210,8 +228,9 @@ class DeviceOpenACCOperator(DeviceOpenACCNoopOperator):
         hoist_prodders(graph)
 
         # Symbol definitions
-        data_manager = DeviceOpenACCDataManager(sregistry)
+        data_manager = DeviceOpenACCDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
+        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -282,8 +301,9 @@ class DeviceOpenACCCustomOperator(DeviceOpenACCOperator):
             passes_mapper['openacc'](graph)
 
         # Symbol definitions
-        data_manager = DeviceOpenACCDataManager(sregistry)
+        data_manager = DeviceOpenACCDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
+        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 

@@ -2,7 +2,8 @@ import pytest
 import numpy as np
 
 from conftest import skipif
-from devito import Grid, Function, TimeFunction, Eq, Operator, norm, solve
+from devito import (Grid, Constant, Function, TimeFunction, Eq, Operator,
+                    ConditionalDimension, norm, solve)
 from devito.data import LEFT
 from devito.ir.iet import retrieve_iteration_tree
 from examples.seismic import TimeAxis, RickerSource, Receiver
@@ -33,6 +34,52 @@ class TestCodeGeneration(object):
             ('acc exit data delete(u[0:u_vec->size[0]]'
              '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])')
 
+    def test_save(self):
+        nt = 10
+
+        grid = Grid(shape=(10, 10, 10))
+        time_dim = grid.time_dim
+
+        factor = Constant(name='factor', value=2, dtype=np.int32)
+        time_sub = ConditionalDimension(name="time_sub", parent=time_dim, factor=factor)
+
+        u = TimeFunction(name='u', grid=grid)
+        usave = TimeFunction(name='usave', grid=grid, time_order=0,
+                             save=int(nt//factor.data), time_dim=time_sub)
+
+        eqns = [Eq(u.forward, u + 1), Eq(usave, u.forward)]
+
+        op = Operator(eqns, platform='nvidiaX', language='openacc')
+
+        # Check `usave` is *not* copied in
+        assert len(op.body[1].header) == 2
+        assert op.body[1].header[0].value ==\
+            ('acc enter data copyin(u[0:u_vec->size[0]]'
+             '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])')
+        assert str(op.body[1].header[1]) == ''
+        assert 'copyin(usave' not in str(op)
+
+        # Check `u` slices are copied back to hack when needed
+        trees = retrieve_iteration_tree(op)
+        assert len(trees) == 3
+        tree = trees[-1]
+        from IPython import embed; embed()
+
+        #pragma acc update self(arr[0:len])
+
+        # Now telling the compiler to keep `usave` on the GPU until the very end
+        op = Operator(eqns, opt=('advanced', {'device-fit': usave}),
+                      platform='nvidiaX', language='openacc')
+
+        assert len(op.body[1].header) == 3
+        assert op.body[1].header[0].value ==\
+            ('acc enter data copyin(u[0:u_vec->size[0]]'
+             '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])')
+        assert op.body[1].header[1].value ==\
+            ('acc enter data copyin(usave[0:usave_vec->size[0]]'
+             '[0:usave_vec->size[1]][0:usave_vec->size[2]][0:usave_vec->size[3]])')
+        assert str(op.body[1].header[2]) == ''
+
 
 class TestOperator(object):
 
@@ -51,6 +98,27 @@ class TestOperator(object):
         op.apply(time_M=time_steps)
 
         assert np.all(np.array(u.data[0, :, :, :]) == time_steps)
+
+    @skipif('nodevice')
+    def test_save(self):
+        nt = 10
+
+        grid = Grid(shape=(10, 10, 10))
+        time_dim = grid.time_dim
+
+        factor = Constant(name='factor', value=2, dtype=np.int32)
+        time_sub = ConditionalDimension(name="time_sub", parent=time_dim, factor=factor)
+
+        u = TimeFunction(name='u', grid=grid)
+        usave = TimeFunction(name='usave', grid=grid, time_order=0,
+                             save=int(nt//factor.data), time_dim=time_sub)
+
+        op = Operator([Eq(u.forward, u + 1), Eq(usave, u.forward)],
+                      platform='nvidiaX', language='openacc')
+
+        op.apply(time_M=nt-1)
+
+        assert all(np.all(usave.data[i] == 2*i + 1) for i in range(usave.save))
 
     @skipif('nodevice')
     def test_iso_ac(self):

@@ -53,7 +53,7 @@ class DataManager(object):
 
     _Parallelizer = Ompizer
 
-    def __init__(self, sregistry):
+    def __init__(self, sregistry, *args):
         """
         Parameters
         ----------

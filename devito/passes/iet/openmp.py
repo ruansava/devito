@@ -89,8 +89,7 @@ class OpenMPRegion(ParallelBlock):
 class OpenMPIteration(ParallelIteration):
 
     def __init__(self, *args, **kwargs):
-        kwargs.pop('pragmas', None)
-        pragma = self._make_header(**kwargs)
+        pragmas, kwargs = self._make_header(**kwargs)
 
         properties = as_tuple(kwargs.pop('properties', None))
         properties += (COLLAPSED(kwargs.get('ncollapse', 1)),)
@@ -102,17 +101,18 @@ class OpenMPIteration(ParallelIteration):
         self.nthreads = kwargs.pop('nthreads', None)
         self.reduction = kwargs.pop('reduction', None)
 
-        super(OpenMPIteration, self).__init__(*args, pragmas=[pragma],
+        super(OpenMPIteration, self).__init__(*args, pragmas=pragmas,
                                               properties=properties, **kwargs)
 
     @classmethod
     def _make_header(cls, **kwargs):
+        kwargs.pop('pragmas', None)
+
         construct = cls._make_construct(**kwargs)
         clauses = cls._make_clauses(**kwargs)
+        header = c.Pragma(' '.join([construct] + clauses))
 
-        header = ' '.join([construct] + clauses)
-
-        return c.Pragma(header)
+        return (header,), kwargs
 
     @classmethod
     def _make_construct(cls, parallel=False, **kwargs):
@@ -154,6 +154,11 @@ class OpenMPIteration(ParallelIteration):
             clauses.append('reduction(+:%s)' % ','.join(args))
 
         return clauses
+
+    @classmethod
+    def _make_other_pragmas(cls, **kwargs):
+        # Subclass hook
+        return ()
 
 
 class ParallelTree(List):
