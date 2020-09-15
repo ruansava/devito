@@ -1,17 +1,20 @@
 from collections import defaultdict
 from functools import partial, singledispatch
 
+from ctypes import c_void_p
 import cgen as c
 from sympy import Function
 import numpy as np
+import sympy
 
 from devito.core.operator import OperatorCore
 from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
-from devito.ir.iet import (Block, Call, Callable, ElementalFunction, Expression, List,
-                           LocalExpression, FindNodes, FindSymbols, MapExprStmts, MapNodes,
-                           Transformer)
+from devito.ir.iet import (Block, Call, Callable, Conditional, ElementalFunction, Expression,
+                           List, LocalExpression, Iteration, CallLambda, FindNodes, FindSymbols,
+                           MapExprStmts, MapNodes, Transformer)
+from devito.ir.support import Scope
 from devito.logger import warning
 from devito.mpi.distributed import MPICommObject
 from devito.mpi.routines import (CopyBuffer, HaloUpdate, IrecvCall, IsendCall, SendRecv,
@@ -21,9 +24,9 @@ from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_i
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
-from devito.symbolics import Byref
+from devito.symbolics import Byref, DefFunction, FieldFromComposite, InlineIf
 from devito.tools import as_tuple, filter_sorted, split, timed_pass
-from devito.types import Symbol
+from devito.types import Dimension, LocalObject, Symbol
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
@@ -298,15 +301,15 @@ class DeviceOpenMPDataManager(DataManager):
             onhost = [self._Parallelizer._map_update_host(f, dm) for f, dm in v]
             mapper[k] = k._rebuild(onhost=onhost)
 
-        # We also gonna execute the Iteration via a C++ parloop on the host
-        parallel_for = make_host_parallel_for()
-        from IPython import embed; embed()
+        # We gonna execute the Iteration via a C++ parloop on the host
+        parfor = make_host_parallel_for()
+        mapper = {k: as_host_parallel_for(v) for k, v in mapper.items()}
 
         # Transform the IET adding pragmas triggering a copy of the written data
         # back to the host
         iet = Transformer(mapper, nested=True).visit(iet)
 
-        return iet, {'efuncs': parallel_for}
+        return iet, {'efuncs': parfor}
 
 
 @iet_pass
@@ -634,5 +637,75 @@ def is_ondevice(f, device_fit):
                 f not in device_fit)
 
 
+class STDVectorThreads(LocalObject):
+    dtype = type('std::vector<std::thread>', (c_void_p,), {})
+
+    def __init__(self):
+        self.name = 'threads'
+
+    # Pickling support
+    _pickle_args = []
+
+
 def make_host_parallel_for():
-    pass
+    """
+    Generate an IET implementing a parallel-for via C++14 threads.
+
+        ..code-bloc:
+    const size_t portion = std::max(threshold, (last - first) / nthreads);
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads);
+    for (int it = first; it < last; it += portion)
+    {   
+          const int begin = it; 
+          const int l = it + portion;
+          const int end = (l > last) ? last : l;
+
+          //Invoke partitioned
+          threads.push_back(std::thread([=, &func]() 
+          {
+               for (int i = begin; i != end; ++i) func(i); 
+          }));
+    }
+
+    //Wait all
+    std::for_each(threads.begin(), threads.end(), [](std::thread& x){ x.join(); });
+    """
+    # Basic symbols
+    threshold = Symbol(name='threshold')
+    last = Symbol(name='last')
+    first = Symbol(name='first')
+    nthreads = Symbol(name='nthreads')
+    portion = Symbol(name='portion', is_const=True)
+
+    # Composite symbols
+    threads = STDVectorThreads()
+
+    # Iteration helper symbols
+    begin = Symbol(name='begin')
+    l = Symbol(name='l')
+    end = Symbol(name='end')
+
+    # Functions
+    stdmax = sympy.Function('std::max')
+
+    eq0 = LocalExpression(DummyEq(portion, stdmax(threshold, (last - first) / nthreads)))
+    eq1 = FieldFromComposite(DefFunction('reserve', [nthreads]), threads)
+
+    it = Dimension(name='it')
+    body = [
+        LocalExpression(DummyEq(begin, it)),
+        LocalExpression(DummyEq(l, it + portion)),
+        LocalExpression(DummyEq(end, InlineIf(l > last, last, l))),
+    ]
+
+    iteration = Iteration(body, it, (first, last, portion))
+
+    i = Dimension(name='i')
+    call = Call('func', i)  #TODO: NOT i...
+    iteration2 = Iteration(Call, i, (begin, end, 1))
+    from IPython import embed; embed()
+
+
+def as_host_parallel_for(iteration):
+    from IPython import embed; embed()
