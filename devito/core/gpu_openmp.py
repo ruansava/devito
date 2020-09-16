@@ -11,8 +11,8 @@ from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import (Call, Callable, Conditional, ElementalFunction, Expression,
-                           LocalExpression, Iteration, CallLambda, FindNodes, FindSymbols,
-                           MapExprStmts, MapNodes, Transformer)
+                           Lambda, LocalExpression, Iteration, FindNodes, FindSymbols,
+                           MapExprStmts, MapNodes, Transformer, make_efunc)
 from devito.ir.support import Scope
 from devito.logger import warning
 from devito.mpi.routines import CopyBuffer, SendRecv, HaloUpdate
@@ -21,7 +21,7 @@ from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_i
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
-from devito.symbolics import DefFunction, FieldFromComposite, InlineIf
+from devito.symbolics import Byref, DefFunction, FieldFromComposite, InlineIf
 from devito.tools import as_tuple, filter_sorted, split, timed_pass
 from devito.types import Dimension, LocalObject, Symbol
 
@@ -595,22 +595,30 @@ def make_host_parallel_for():
     # Functions
     stdmax = sympy.Function('std::max')
 
-    eq0 = LocalExpression(DummyEq(portion, stdmax(threshold, (last - first) / nthreads)))
-    eq1 = FieldFromComposite(DefFunction('reserve', [nthreads]), threads)
+    # Construct the parallel-for body
+    funcname = 'func'
+    i = Dimension(name='i')
+    threadobj = Call('std::thread', Lambda(
+        Iteration(Call(funcname, i), i, (begin, end-1, 1)),  #TODO: NOT i
+        ['=', Byref(funcname)],
+    ))
+    threadpush = Call(FieldFromComposite('push_back', threads), threadobj)
 
     it = Dimension(name='it')
-    body = [
+    iteration = Iteration([
         LocalExpression(DummyEq(begin, it)),
         LocalExpression(DummyEq(l, it + portion)),
         LocalExpression(DummyEq(end, InlineIf(l > last, last, l))),
+        threadpush
+    ], it, (first, last-1, portion))
+
+    body = [
+        LocalExpression(DummyEq(portion, stdmax(threshold, (last - first) / nthreads))),
+        Call(FieldFromComposite('reserve', threads), nthreads),
+        iteration
     ]
 
-    iteration = Iteration(body, it, (first, last, portion))
-
-    i = Dimension(name='i')
-    call = Call('func', i)  #TODO: NOT i...
-    iteration2 = Iteration(Call, i, (begin, end, 1))
-    from IPython import embed; embed()
+    return make_efunc('parallel_for', body)
 
 
 def as_host_parallel_for(iteration):
