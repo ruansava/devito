@@ -335,7 +335,7 @@ class CGen(Visitor):
     def visit_Lambda(self, o):
         body = flatten(self._visit(i) for i in o.children)
         captures = [str(i) for i in o.captures]
-        decls = self._args_decl(o.parameters)
+        decls = [i.inline() for i in self._args_decl(o.parameters)]
         top = c.Line('[%s](%s)' % (', '.join(captures), ', '.join(decls)))
         return LambdaCollection([top, c.Block(body)])
 
