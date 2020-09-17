@@ -11,9 +11,10 @@ from devito.core.operator import OperatorCore
 from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
-from devito.ir.iet import (Block, Call, Callable, Conditional, ElementalFunction, Expression,
-                           List, Lambda, LocalExpression, Iteration, FindNodes,
-                           FindSymbols, MapExprStmts, MapNodes, Transformer, make_efunc)
+from devito.ir.iet import (Block, Call, Callable, ElementalFunction, Expression,
+                           Lambda, List, LocalExpression, Iteration, FindNodes,
+                           FindSymbols, MapExprStmts, MapNodes, Transformer,
+                           retrieve_iteration_tree, filter_iterations)
 from devito.ir.support import Scope
 from devito.logger import warning
 from devito.mpi.distributed import MPICommObject
@@ -24,36 +25,12 @@ from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_i
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
-from devito.symbolics import Byref, DefFunction, FieldFromComposite, InlineIf
+from devito.symbolics import Byref, FieldFromComposite, InlineIf
 from devito.tools import as_tuple, filter_sorted, split, timed_pass
 from devito.types import Dimension, LocalObject, Symbol
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
-
-
-class HostParallelIteration(List):
-
-    # Can be used anywhere an Iteration is expected
-    is_Iteration = True
-
-    def __init__(self, body, pragmas=None):
-        # `body` may be a tuple of length 1 upon reconstruction
-        body = as_tuple(body)
-        assert len(body) == 1
-        body = body[0]
-        if isinstance(body, CallParfor):
-            super().__init__(header=pragmas, body=body)
-        else:
-            assert body.is_Iteration
-            super().__init__(header=pragmas, body=CallParfor(body))
-
-    def __getattr__(self, name):
-        return getattr(self.iteration, name)
-
-    @property
-    def iteration(self):
-        return self.body[0].iteration
 
 
 class DeviceOpenMPIteration(OpenMPIteration):
@@ -89,7 +66,6 @@ class DeviceOmpizer(Ompizer):
     })
 
     _Iteration = DeviceOpenMPIteration
-    _HostIteration = HostParallelIteration
 
     def __init__(self, sregistry, options, key=None):
         super().__init__(sregistry, options, key=key)
@@ -165,21 +141,16 @@ class DeviceOmpizer(Ompizer):
         collapsable = self._find_collapsable(root, candidates)
         ncollapse = 1 + len(collapsable)
 
-        functions = FindSymbols().visit(root)
-        if all(is_ondevice(f, self.device_fit) for f in functions):
+        if is_ondevice(root, self.device_fit):
             # The typical case: all accessed Function's are device Function's, that is
             # all Function's are in the device memory. Then we offload the candidate
             # Iterations to the device
             body = self._Iteration(ncollapse=ncollapse, **root.args)
+            partree = ParallelTree([], body, nthreads=nthreads)
+            collapsed = [partree] + collapsable
+            return root, partree, collapsed
         else:
-            # Some Function's are on the host, then we parallelize the Iteration tree
-            # on the host
-            body = self._HostIteration(root)
-        partree = ParallelTree([], body, nthreads=nthreads)
-
-        collapsed = [partree] + collapsable
-
-        return root, partree, collapsed
+            return root, None, None
 
     def _make_parregion(self, partree, *args):
         # no-op for now
@@ -194,12 +165,69 @@ class DeviceOmpizer(Ompizer):
         return partree
 
 
+class HostParallelIteration(List):
+
+    # Can be used anywhere an Iteration is expected
+    is_Iteration = True
+
+    def __init__(self, body, pragmas=None):
+        # `body` may be a tuple of length 1 upon reconstruction
+        body = as_tuple(body)
+        assert len(body) == 1
+        body = body[0]
+        if isinstance(body, CallParfor):
+            super().__init__(header=pragmas, body=body)
+        else:
+            assert body.is_Iteration
+            super().__init__(header=pragmas, body=CallParfor(body))
+
+    def __getattr__(self, name):
+        return getattr(self.iteration, name)
+
+    @property
+    def iteration(self):
+        return self.body[0].iteration
+
+
+class HostParallelizer(object):
+
+    def __init__(self, sregistry, options):
+        self.sregistry = sregistry
+        self.device_fit = options['device-fit']
+
+    @property
+    def nthreads(self):
+        return self.sregistry.nthreads
+
+    @iet_pass
+    def make_parallel(self, iet):
+        key = lambda i: i.is_Parallel and not is_ondevice(i, self.device_fit)
+
+        mapper = {}
+        for tree in retrieve_iteration_tree(iet):
+            candidates = filter_iterations(tree, key=key)
+            if not candidates:
+                continue
+            root = candidates[0]
+            if root in mapper:
+                continue
+            mapper[root] = HostParallelIteration(root)
+
+        if mapper:
+            iet = Transformer(mapper, nested=True).visit(iet)
+            parfor = make_host_parallel_for(self.nthreads)
+            return iet, {'efuncs': [parfor], 'args': [self.nthreads],
+                         'includes': ('vector', 'thread', 'algorithm')}
+        else:
+            return iet, {}
+
+
 class DeviceOpenMPDataManager(DataManager):
 
     _Parallelizer = DeviceOmpizer
 
     def __init__(self, sregistry, options):
-        """ 
+        """
         Parameters
         ----------
         sregistry : SymbolRegistry
@@ -290,11 +318,9 @@ class DeviceOpenMPDataManager(DataManager):
 
     @iet_pass
     def place_onhost(self, iet):
-        device_fit = self.device_fit
-
         # Analysis
         mapper = defaultdict(set)
-        visitor = MapNodes(Iteration, self._Parallelizer._HostIteration, 'immediate')
+        visitor = MapNodes(Iteration, HostParallelIteration, 'immediate')
         for k, v in visitor.visit(iet).items():
             #TODO: Check with test where len(ih) > 1
 
@@ -316,14 +342,11 @@ class DeviceOpenMPDataManager(DataManager):
             onhost = [self._Parallelizer._map_update_host(f, dm) for f, dm in v]
             mapper[k] = k._rebuild(pragmas=onhost)
 
-        # We gonna execute the Iteration via a C++ parloop on the host
-        parfor = make_host_parallel_for()
-
         # Transform the IET adding pragmas triggering a copy of the written data
         # back to the host
         iet = Transformer(mapper, nested=True).visit(iet)
 
-        return iet, {'efuncs': [parfor], 'includes': ('vector', 'thread', 'algorithm')}
+        return iet, {}
 
 
 @iet_pass
@@ -515,6 +538,9 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         # GPU parallelism via OpenMP offloading
         DeviceOmpizer(sregistry, options).make_parallel(graph)
 
+        # Host parallelism via C++ parallel loops
+        HostParallelizer(sregistry, options).make_parallel(graph)
+
         # Symbol definitions
         data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
@@ -544,6 +570,9 @@ class DeviceOpenMPOperator(DeviceOpenMPNoopOperator):
         # GPU parallelism via OpenMP offloading
         DeviceOmpizer(sregistry, options).make_parallel(graph)
 
+        # Host parallelism via C++ parallel loops
+        HostParallelizer(sregistry, options).make_parallel(graph)
+
         # Misc optimizations
         hoist_prodders(graph)
 
@@ -568,7 +597,7 @@ class DeviceOpenMPOperator(DeviceOpenMPNoopOperator):
 
 class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
 
-    _known_passes = ('optcomms', 'openmp', 'mpi', 'prodders', 'gpu-direct')
+    _known_passes = ('optcomms', 'openmp', 'c++par', 'mpi', 'prodders', 'gpu-direct')
     _known_passes_disabled = ('blocking', 'denormals', 'simd')
     assert not (set(_known_passes) & set(_known_passes_disabled))
 
@@ -578,10 +607,12 @@ class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
         sregistry = kwargs['sregistry']
 
         ompizer = DeviceOmpizer(sregistry, options)
+        parizer = HostParallelizer(sregistry, options)
 
         return {
             'optcomms': partial(optimize_halospots),
             'openmp': partial(ompizer.make_parallel),
+            'c++par': partial(parizer.make_parallel),
             'mpi': partial(mpiize, mode=options['mpi']),
             'prodders': partial(hoist_prodders),
             'gpu-direct': partial(mpi_gpu_direct)
@@ -641,14 +672,19 @@ class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
 
 # Utils
 
-def is_ondevice(f, device_fit):
+def is_ondevice(maybe_symbol, device_fit):
     """
-    True if `f` is allocated in the device memory, False otherwise.
+    True if all functions are allocated in the device memory, False otherwise.
     """
-    f = f.function  # `f` may be an Indexed or an actual Function
-    return not (f.is_TimeFunction and
-                f.save is not None and
-                f not in device_fit)
+    # `maybe_symbol` may be an Indexed, a Function, or even an actual piece of IET
+    try:
+        functions = (maybe_symbol.function,)
+    except AttributeError:
+        assert maybe_symbol.is_Node
+        functions = FindSymbols().visit(maybe_symbol)
+
+    return all(not (f.is_TimeFunction and f.save is not None and f not in device_fit)
+               for f in functions)
 
 
 class STDVectorThreads(LocalObject):
@@ -661,35 +697,34 @@ class STDVectorThreads(LocalObject):
     _pickle_args = []
 
 
-def make_host_parallel_for():
+class STDThread(LocalObject):
+    dtype = type('std::thread&', (c_void_p,), {})
+
+    def __init__(self, name):
+        self.name = name
+
+    # Pickling support
+    _pickle_args = ['name']
+
+
+class FunctionType(LocalObject):
+    dtype = type('Function_type&&', (c_void_p,), {})
+
+    def __init__(self, name):
+        self.name = name
+
+    # Pickling support
+    _pickle_args = ['name']
+
+
+def make_host_parallel_for(nthreads):
     """
     Generate an IET implementing a parallel-for via C++14 threads.
-
-        ..code-bloc:
-    const size_t portion = std::max(threshold, (last - first) / nthreads);
-    std::vector<std::thread> threads;
-    threads.reserve(nthreads);
-    for (int it = first; it < last; it += portion)
-    {   
-          const int begin = it; 
-          const int l = it + portion;
-          const int end = (l > last) ? last : l;
-
-          //Invoke partitioned
-          threads.push_back(std::thread([=, &func]() 
-          {
-               for (int i = begin; i != end; ++i) func(i); 
-          }));
-    }
-
-    //Wait all
-    std::for_each(threads.begin(), threads.end(), [](std::thread& x){ x.join(); });
     """
     # Basic symbols
-    threshold = Symbol(name='threshold')
-    last = Symbol(name='last')
-    first = Symbol(name='first')
-    nthreads = Symbol(name='nthreads')
+    threshold = Symbol(name='threshold', is_const=True)
+    last = Symbol(name='last', is_const=True)
+    first = Symbol(name='first', is_const=True)
     portion = Symbol(name='portion', is_const=True)
 
     # Composite symbols
@@ -704,14 +739,13 @@ def make_host_parallel_for():
     stdmax = sympy.Function('std::max')
 
     # Construct the parallel-for body
-    funcname = 'func'
+    func = FunctionType('func')
     i = Dimension(name='i')
     threadobj = Call('std::thread', Lambda(
-        Iteration(Call(funcname, i), i, (begin, end-1, 1)),
-        ['=', Byref(funcname)],
+        Iteration(Call(func.name, i), i, (begin, end-1, 1)),
+        ['=', Byref(func.name)],
     ))
     threadpush = Call(FieldFromComposite('push_back', threads), threadobj)
-
     it = Dimension(name='it')
     iteration = Iteration([
         LocalExpression(DummyEq(begin, it)),
@@ -719,14 +753,24 @@ def make_host_parallel_for():
         LocalExpression(DummyEq(end, InlineIf(l > last, last, l))),
         threadpush
     ], it, (first, last, portion))
-
+    thread = STDThread('x')
+    waitcall = Call('std::for_each', [
+        Call(FieldFromComposite('begin', threads)),
+        Call(FieldFromComposite('end', threads)),
+        Lambda(Call(FieldFromComposite('join', thread.name)), [], [thread])
+    ])
     body = [
         LocalExpression(DummyEq(portion, stdmax(threshold, (last - first) / nthreads))),
+        LocalExpression(DummyEq(threshold, 1)),
         Call(FieldFromComposite('reserve', threads), nthreads),
-        iteration
+        iteration,
+        waitcall
     ]
 
-    return make_efunc('parallel_for', body)
+    parameters = [first, last, func, nthreads]
+    parfor = ElementalFunction('parallel_for', body, 'void', parameters)
+
+    return parfor
 
 
 class CallParfor(Call):
