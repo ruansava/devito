@@ -61,9 +61,9 @@ class TestCodeGeneration(object):
 
         # Check `u` slices are copied back to hack when needed
         trees = retrieve_iteration_tree(op)
+        from IPython import embed; embed()
         assert len(trees) == 3
         tree = trees[-1]
-        from IPython import embed; embed()
 
         #pragma acc update self(arr[0:len])
 
