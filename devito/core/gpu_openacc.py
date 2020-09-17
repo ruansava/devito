@@ -3,8 +3,7 @@ from functools import partial, singledispatch
 import cgen as c
 
 from devito.core.gpu_openmp import (DeviceOpenMPNoopOperator, DeviceOpenMPIteration,
-                                    HostOpenMPIteration, DeviceOmpizer,
-                                    DeviceOpenMPDataManager, is_ondevice)
+                                    DeviceOmpizer, DeviceOpenMPDataManager, is_ondevice)
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import Call, ElementalFunction, FindSymbols, List, LocalExpression
@@ -22,19 +21,6 @@ __all__ = ['DeviceOpenACCNoopOperator', 'DeviceOpenACCOperator',
 
 # TODO: currently inhereting from the OpenMP Operators. Ideally, we should/could
 # abstract things away so as to have a separate, language-agnostic superclass
-
-
-class HostOpenACCIteration(HostOpenMPIteration):
-
-    @classmethod
-    def _make_construct(cls, **kwargs):
-        return 'acc parallel loop self'
-
-    @classmethod
-    def _make_clauses(cls, **kwargs):
-        #kwargs['chunk_size'] = False
-        #TODO: ASYNC??
-        return super()._make_clauses(**kwargs)
 
 
 class DeviceOpenACCIteration(DeviceOpenMPIteration):
@@ -79,7 +65,6 @@ class DeviceAccizer(DeviceOmpizer):
     }
 
     _Iteration = DeviceOpenACCIteration
-    _HostIteration = HostOpenACCIteration
 
     @classmethod
     def _map_present(cls, f):
