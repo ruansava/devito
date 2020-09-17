@@ -11,8 +11,8 @@ from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import (Call, Callable, Conditional, ElementalFunction, Expression,
-                           Lambda, LocalExpression, Iteration, FindNodes, FindSymbols,
-                           MapExprStmts, MapNodes, Transformer, make_efunc)
+                           Lambda, List, LocalExpression, Iteration, FindNodes,
+                           FindSymbols, MapExprStmts, MapNodes, Transformer, make_efunc)
 from devito.ir.support import Scope
 from devito.logger import warning
 from devito.mpi.routines import CopyBuffer, SendRecv, HaloUpdate
@@ -29,13 +29,24 @@ __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
 
 
-class HostOpenMPIteration(OpenMPIteration):
+class HostParallelIteration(List):
 
-    @classmethod
-    def _make_header(cls, **kwargs):
-        pragmas, kwargs = super()._make_header(**kwargs)
-        pragmas = as_tuple(kwargs.pop('onhost', None)) + pragmas
-        return pragmas, kwargs
+    # Can be used anywhere an Iteration is expected
+    is_Iteration = True
+
+    def __init__(self, body, pragmas=None):
+        assert body.is_Iteration
+        #TODO: UPON RECONSTRUCTION BODY IS A TUPLE...
+        ascall = Call('parallel_for', [
+            body.symbolic_min,
+            body.symbolic_max,
+            Lambda(body.nodes, ['='], [body.dim])
+        ])
+        super().__init__(header=pragmas, body=ascall)
+        self.iteration = body
+
+    def __getattr__(self, name):
+        return getattr(self.iteration, name)
 
 
 class DeviceOpenMPIteration(OpenMPIteration):
@@ -69,7 +80,7 @@ class DeviceOmpizer(Ompizer):
     })
 
     _Iteration = DeviceOpenMPIteration
-    _HostIteration = HostOpenMPIteration
+    _HostIteration = HostParallelIteration
 
     def __init__(self, sregistry, options, key=None):
         super().__init__(sregistry, options, key=key)
@@ -152,7 +163,7 @@ class DeviceOmpizer(Ompizer):
         else:
             # Some Function's are on the host, then we parallelize the Iteration tree
             # on the host
-            body = self._HostIteration(ncollapse=ncollapse, **root.args)
+            body = self._HostIteration(root)
         partree = ParallelTree([], body, nthreads=nthreads)
 
         collapsed = [partree] + collapsable
@@ -292,11 +303,10 @@ class DeviceOpenMPDataManager(DataManager):
         # Post-process analysis
         for k, v in list(mapper.items()):
             onhost = [self._Parallelizer._map_update_host(f, dm) for f, dm in v]
-            mapper[k] = k._rebuild(onhost=onhost)
+            mapper[k] = k._rebuild(pragmas=onhost)
 
         # We gonna execute the Iteration via a C++ parloop on the host
         parfor = make_host_parallel_for()
-        mapper = {k: as_host_parallel_for(v) for k, v in mapper.items()}
 
         # Transform the IET adding pragmas triggering a copy of the written data
         # back to the host
@@ -619,7 +629,3 @@ def make_host_parallel_for():
     ]
 
     return make_efunc('parallel_for', body)
-
-
-def as_host_parallel_for(iteration):
-    from IPython import embed; embed()
