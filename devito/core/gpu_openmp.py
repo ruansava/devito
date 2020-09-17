@@ -38,18 +38,22 @@ class HostParallelIteration(List):
     is_Iteration = True
 
     def __init__(self, body, pragmas=None):
-        assert body.is_Iteration
-        #TODO: UPON RECONSTRUCTION BODY IS A TUPLE...
-        ascall = Call('parallel_for', [
-            body.symbolic_min,
-            body.symbolic_max,
-            Lambda(body.nodes, ['='], [body.dim])
-        ])
-        super().__init__(header=pragmas, body=ascall)
-        self.iteration = body
+        # `body` may be a tuple of length 1 upon reconstruction
+        body = as_tuple(body)
+        assert len(body) == 1
+        body = body[0]
+        if isinstance(body, CallParfor):
+            super().__init__(header=pragmas, body=body)
+        else:
+            assert body.is_Iteration
+            super().__init__(header=pragmas, body=CallParfor(body))
 
     def __getattr__(self, name):
         return getattr(self.iteration, name)
+
+    @property
+    def iteration(self):
+        return self.body[0].iteration
 
 
 class DeviceOpenMPIteration(OpenMPIteration):
@@ -319,7 +323,7 @@ class DeviceOpenMPDataManager(DataManager):
         # back to the host
         iet = Transformer(mapper, nested=True).visit(iet)
 
-        return iet, {'efuncs': parfor}
+        return iet, {'efuncs': [parfor], 'includes': ('vector', 'thread', 'algorithm')}
 
 
 @iet_pass
@@ -703,7 +707,7 @@ def make_host_parallel_for():
     funcname = 'func'
     i = Dimension(name='i')
     threadobj = Call('std::thread', Lambda(
-        Iteration(Call(funcname, i), i, (begin, end-1, 1)),  #TODO: NOT i
+        Iteration(Call(funcname, i), i, (begin, end-1, 1)),
         ['=', Byref(funcname)],
     ))
     threadpush = Call(FieldFromComposite('push_back', threads), threadobj)
@@ -714,7 +718,7 @@ def make_host_parallel_for():
         LocalExpression(DummyEq(l, it + portion)),
         LocalExpression(DummyEq(end, InlineIf(l > last, last, l))),
         threadpush
-    ], it, (first, last-1, portion))
+    ], it, (first, last, portion))
 
     body = [
         LocalExpression(DummyEq(portion, stdmax(threshold, (last - first) / nthreads))),
@@ -723,3 +727,14 @@ def make_host_parallel_for():
     ]
 
     return make_efunc('parallel_for', body)
+
+
+class CallParfor(Call):
+
+    def __init__(self, iteration):
+        super().__init__('parallel_for', [
+            iteration.symbolic_min,
+            iteration.symbolic_max,
+            Lambda(iteration.nodes, ['='], [iteration.dim])
+        ])
+        self.iteration = iteration
