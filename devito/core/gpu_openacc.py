@@ -3,7 +3,8 @@ from functools import partial, singledispatch
 import cgen as c
 
 from devito.core.gpu_openmp import (DeviceOpenMPNoopOperator, DeviceOpenMPIteration,
-                                    DeviceOmpizer, DeviceOpenMPDataManager, is_ondevice)
+                                    DeviceOmpizer, DeviceOpenMPDataManager,
+                                    HostParallelizer)
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import Call, ElementalFunction, FindSymbols, List, LocalExpression
@@ -179,6 +180,9 @@ class DeviceOpenACCNoopOperator(DeviceOpenMPNoopOperator):
         # GPU parallelism via OpenACC offloading
         DeviceAccizer(sregistry, options).make_parallel(graph)
 
+        # Host parallelism via C++ parallel loops
+        HostParallelizer(sregistry, options).make_parallel(graph)
+
         # Symbol definitions
         data_manager = DeviceOpenACCDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
@@ -209,6 +213,9 @@ class DeviceOpenACCOperator(DeviceOpenACCNoopOperator):
         # GPU parallelism via OpenACC offloading
         DeviceAccizer(sregistry, options).make_parallel(graph)
 
+        # Host parallelism via C++ parallel loops
+        HostParallelizer(sregistry, options).make_parallel(graph)
+
         # Misc optimizations
         hoist_prodders(graph)
 
@@ -228,7 +235,7 @@ class DeviceOpenACCOperator(DeviceOpenACCNoopOperator):
 
 class DeviceOpenACCCustomOperator(DeviceOpenACCOperator):
 
-    _known_passes = ('optcomms', 'openacc', 'mpi', 'prodders')
+    _known_passes = ('optcomms', 'openacc', 'c++par', 'mpi', 'prodders')
     _known_passes_disabled = ('blocking', 'openmp', 'denormals', 'simd')
     assert not (set(_known_passes) & set(_known_passes_disabled))
 
@@ -238,10 +245,12 @@ class DeviceOpenACCCustomOperator(DeviceOpenACCOperator):
         sregistry = kwargs['sregistry']
 
         accizer = DeviceAccizer(sregistry, options)
+        parizer = HostParallelizer(sregistry, options)
 
         return {
             'optcomms': partial(optimize_halospots),
             'openacc': partial(accizer.make_parallel),
+            'c++par': partial(parizer.make_parallel),
             'mpi': partial(mpiize, mode=options['mpi']),
             'prodders': partial(hoist_prodders)
         }
