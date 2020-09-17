@@ -5,7 +5,8 @@ from conftest import skipif
 from devito import (Grid, Constant, Function, TimeFunction, Eq, Operator,
                     ConditionalDimension, norm, solve)
 from devito.data import LEFT
-from devito.ir.iet import retrieve_iteration_tree
+from devito.ir.iet import FindNodes, retrieve_iteration_tree
+from devito.core.gpu_openmp import HostParallelIteration
 from examples.seismic import TimeAxis, RickerSource, Receiver
 
 
@@ -49,28 +50,27 @@ class TestCodeGeneration(object):
 
         eqns = [Eq(u.forward, u + 1), Eq(usave, u.forward)]
 
+        # Make sure `u[t1]` is copied back to the host, and HostParallelIteration
         op = Operator(eqns, platform='nvidiaX', language='openacc')
-
-        # Check `usave` is *not* copied in
         assert len(op.body[1].header) == 2
         assert op.body[1].header[0].value ==\
             ('acc enter data copyin(u[0:u_vec->size[0]]'
              '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])')
         assert str(op.body[1].header[1]) == ''
         assert 'copyin(usave' not in str(op)
-
-        # Check `u` slices are copied back to hack when needed
         trees = retrieve_iteration_tree(op)
-        from IPython import embed; embed()
-        assert len(trees) == 3
-        tree = trees[-1]
-
-        #pragma acc update self(arr[0:len])
+        assert len(trees) == 2
+        hpis = FindNodes(HostParallelIteration).visit(op)
+        assert len(hpis) == 1
+        hpi = hpis[0]
+        assert len(hpi.header) == 1
+        assert 'acc update self(u[t' in hpi.header[0].value
+        assert '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])'\
+            in hpi.header[0].value
 
         # Now telling the compiler to keep `usave` on the GPU until the very end
         op = Operator(eqns, opt=('advanced', {'device-fit': usave}),
                       platform='nvidiaX', language='openacc')
-
         assert len(op.body[1].header) == 3
         assert op.body[1].header[0].value ==\
             ('acc enter data copyin(u[0:u_vec->size[0]]'
@@ -79,6 +79,8 @@ class TestCodeGeneration(object):
             ('acc enter data copyin(usave[0:usave_vec->size[0]]'
              '[0:usave_vec->size[1]][0:usave_vec->size[2]][0:usave_vec->size[3]])')
         assert str(op.body[1].header[2]) == ''
+        hpis = FindNodes(HostParallelIteration).visit(op)
+        assert len(hpis) == 0
 
 
 class TestOperator(object):
