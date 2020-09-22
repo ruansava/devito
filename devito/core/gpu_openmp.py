@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from functools import partial, singledispatch
 
 from ctypes import c_void_p
@@ -11,7 +11,7 @@ from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import (Call, Callable, ElementalFunction, Expression,
-                           Lambda, List, LocalExpression, Iteration, FindNodes,
+                           List, LocalExpression, Iteration, While, FindNodes,
                            FindSymbols, MapExprStmts, MapNodes, Transformer,
                            retrieve_iteration_tree, filter_iterations)
 from devito.ir.support import Scope
@@ -23,7 +23,7 @@ from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
 from devito.symbolics import Byref, FieldFromComposite, InlineIf
-from devito.tools import as_tuple, filter_sorted, split, timed_pass
+from devito.tools import as_tuple, filter_ordered, filter_sorted, split, timed_pass
 from devito.types import Dimension, LocalObject, Symbol
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
@@ -162,6 +162,10 @@ class HostParallelIteration(OpenMPIteration):
     pass
 
 
+DataMap = namedtuple('DataMap', 'iterator symbolic_size')
+#TODO: DataMap -> IterMap
+
+
 class HostParallelizer(object):
 
     def __init__(self, sregistry, options):
@@ -172,14 +176,38 @@ class HostParallelizer(object):
     def nthreads(self):
         return self.sregistry.nthreads
 
-    @iet_pass
-    def make_parallel(self, iet):
+    def _make_datamaps(self, indexeds, root):
+        """
+        Build a datamap for the Indexed's in a tree. A datamap is used to
+        distinguish parallel from sequential Dimensions.
+        """
         mapper = defaultdict(set)
-        for tree in retrieve_iteration_tree(iet):
+        for indexed in indexeds:
+            f = indexed.function
+            if not f.is_DiscreteFunction:
+                continue
+
+            assert root.dim in f.dimensions
+            n = f.dimensions.index(root.dim)
+            datamap = indexed.indices[:n] + (FULL,)*len(indexed.indices[n:])
+            mapper[indexed.function].add(tuple(datamap))
+
+        return mapper
+
+    def _find_candidates(self, trees):
+        """
+        Detect all candidate HostParallelIteration's. Also collect metadata.
+        """
+        mapper = {}
+        for tree in trees:
+            # If already offloaded to the device, ignore
+            if any(isinstance(i, DeviceOpenMPIteration) for i in tree):
+                continue
+
+            # Pick up the `root` of the potential HostParallelIteration
             candidates = filter_iterations(tree, key=lambda i: i.is_Parallel)
             if not candidates:
                 continue
-
             root = candidates[0]
             if root in mapper:
                 continue
@@ -189,21 +217,70 @@ class HostParallelizer(object):
             if not onhost:
                 continue
 
-            # What Function's should be copied back to the host?
-            # TODO: no data dependence analysis is performed, so all on-device
-            # Function`s`, including the read-only ones, will be copied back
-            for indexed in ondevice:
-                f = indexed.function
-                assert root.dim in f.dimensions
-                if f.is_DiscreteFunction:
-                    n = f.dimensions.index(root.dim)
-                    datamap = indexed.indices[:n] + (FULL,)*len(indexed.indices[n:])
-                    mapper[root].add((f, tuple(datamap)))
+            # Get the Function's that, if written, will have to be copied to the host
+            mapper[root] = self._make_datamaps(ondevice, root)
 
-        
-                    from IPython import embed; embed()
-            mapper[root] = HostParallelIteration(**root.args)
+        return mapper
 
+    def _find_next_write(self, root, reads, trees):
+        """
+        Return the closest tree performing a write to the Function's read in ``root``.
+        Also collect metadata.
+        """
+        for tree in sorted(trees, key=lambda i: root in i, reverse=True):
+            if root in tree:
+                continue
+
+            for i in tree:
+                if isinstance(i, DeviceOpenMPIteration):
+                    indexeds = [e.output for e in FindNodes(Expression).visit(i)]
+                    if not any(idx.function in reads for idx in indexeds):
+                        break
+
+                    return i, self._make_datamaps(indexeds, i)
+
+        return None, None
+
+    def _make_lock(self, wmetadata):
+        name = self.sregistry.make_name(prefix='devicelock')
+
+        require_lock = []
+        for f, datamaps in wmetadata.items():
+            for datamap in datamaps:
+                for d, i in zip(f.dimensions, datamap):
+                    if i is FULL:
+                        break
+                    else:
+                        from IPython import embed; embed()
+                require_lock.extend([i for i in datamap if i is not FULL])
+
+        for i in filter_ordered(require_lock):
+            if i.is_Modulo:
+                from IPython import embed; embed()
+            else:
+                raise NotImplementedError
+
+        return Array(name=name, dimensions=dimensions)
+
+    @iet_pass
+    def make_parallel(self, iet):
+        trees = retrieve_iteration_tree(iet)
+
+        mapper = self._find_candidates(trees)
+
+        for root, rmetadata in mapper.items():
+            reads = set(rmetadata)
+            wnext, wmetadata = self._find_next_write(root, reads, trees)
+            if wnext is None:
+                continue
+
+            lock = self._make_lock(wmetadata)
+            List(haeder=c.Comment("Wait for `%s` to be copied to the host" %
+                                  ",".join(i.name for i in reads)),
+                 body=While())
+            from IPython import embed; embed()
+
+            subs[root] = HostParallelIteration(**root.args)
 
         iet = Transformer(mapper, nested=True).visit(iet)
 
