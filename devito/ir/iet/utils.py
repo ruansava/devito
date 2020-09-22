@@ -6,13 +6,22 @@ from devito.symbolics import Literal, Macro
 from devito.tools import flatten, ReducerMap
 from devito.types import Array, LocalObject
 
-__all__ = ['filter_iterations', 'retrieve_iteration_tree',
+__all__ = ['filter_iterations', 'retrieve_iteration_tree', 'reverse_breadth_traversal',
            'compose_nodes', 'derive_parameters', 'find_affine_trees']
 
 
 def retrieve_iteration_tree(node, mode='normal'):
     """
     A list with all Iteration sub-trees within an IET.
+
+    Parameters
+    ----------
+    iet : Node
+        The searched Iteration/Expression tree.
+    mode : str, optional
+        - ``normal``
+        - ``superset``: Iteration trees that are subset of larger iteration trees
+                        are dropped.
 
     Examples
     --------
@@ -23,23 +32,14 @@ def retrieve_iteration_tree(node, mode='normal'):
            Iteration i
              expr0
              Iteration j
-               Iteraion k
+               Iteration k
                  expr1
              Iteration p
                expr2
 
-    Return the list: ::
+    Return the list:
 
         [(Iteration i, Iteration j, Iteration k), (Iteration i, Iteration p)]
-
-    Parameters
-    ----------
-    iet : Node
-        The searched Iteration/Expression tree.
-    mode : str, optional
-        - ``normal``
-        - ``superset``: Iteration trees that are subset of larger iteration trees
-                        are dropped.
     """
     assert mode in ('normal', 'superset')
 
@@ -156,3 +156,36 @@ def find_affine_trees(iet):
                 else:
                     break
     return affine
+
+
+def reverse_breadth_traversal(iet, root):
+    """
+    Perform a reverse breadth traversal of the input IET starting at ``root``.
+
+    Examples
+    --------
+    Given the Iteration tree:
+
+        .. code-block:: c
+
+           Iteration i
+             Iteration j
+               Iteration k0
+                 expr1
+               Iteration k1
+                 expr2
+               Iteration k2
+                 expr3
+               Conditional c0
+                 expr4
+             Iteration p
+               expr5
+
+    and assuming ``start = Iteration k1``, return the tuple:
+
+        [k1, k2, c0, k0, j, p, i]
+    """
+    for tree in retrieve_iteration_tree(iet):
+        for i in reversed(tree):
+            if root is i:
+

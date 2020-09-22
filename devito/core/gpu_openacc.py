@@ -186,7 +186,6 @@ class DeviceOpenACCNoopOperator(DeviceOpenMPNoopOperator):
         # Symbol definitions
         data_manager = DeviceOpenACCDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
-        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -222,7 +221,6 @@ class DeviceOpenACCOperator(DeviceOpenACCNoopOperator):
         # Symbol definitions
         data_manager = DeviceOpenACCDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
-        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -297,7 +295,6 @@ class DeviceOpenACCCustomOperator(DeviceOpenACCOperator):
         # Symbol definitions
         data_manager = DeviceOpenACCDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
-        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 

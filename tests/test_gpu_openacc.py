@@ -52,6 +52,7 @@ class TestCodeGeneration(object):
 
         # Make sure `u[t1]` is copied back to the host, and HostParallelIteration
         op = Operator(eqns, platform='nvidiaX', language='openacc')
+        from IPython import embed; embed()
         assert len(op.body[1].header) == 2
         assert op.body[1].header[0].value ==\
             ('acc enter data copyin(u[0:u_vec->size[0]]'

@@ -158,28 +158,8 @@ class DeviceOmpizer(Ompizer):
         return partree
 
 
-class HostParallelIteration(List):
-
-    # Can be used anywhere an Iteration is expected
-    is_Iteration = True
-
-    def __init__(self, body, pragmas=None):
-        # `body` may be a tuple of length 1 upon reconstruction
-        body = as_tuple(body)
-        assert len(body) == 1
-        body = body[0]
-        if isinstance(body, CallParfor):
-            super().__init__(header=pragmas, body=body)
-        else:
-            assert body.is_Iteration
-            super().__init__(header=pragmas, body=CallParfor(body))
-
-    def __getattr__(self, name):
-        return getattr(self.iteration, name)
-
-    @property
-    def iteration(self):
-        return self.body[0].iteration
+class HostParallelIteration(OpenMPIteration):
+    pass
 
 
 class HostParallelizer(object):
@@ -194,25 +174,44 @@ class HostParallelizer(object):
 
     @iet_pass
     def make_parallel(self, iet):
-        key = lambda i: i.is_Parallel and not is_ondevice(i, self.device_fit)
-
-        mapper = {}
+        mapper = defaultdict(set)
         for tree in retrieve_iteration_tree(iet):
-            candidates = filter_iterations(tree, key=key)
+            candidates = filter_iterations(tree, key=lambda i: i.is_Parallel)
             if not candidates:
                 continue
+
             root = candidates[0]
             if root in mapper:
                 continue
-            mapper[root] = HostParallelIteration(root)
 
-        if mapper:
-            iet = Transformer(mapper, nested=True).visit(iet)
-            parfor = make_host_parallel_for(self.nthreads)
-            return iet, {'efuncs': [parfor], 'args': [self.nthreads],
-                         'includes': ('vector', 'thread', 'algorithm')}
-        else:
-            return iet, {}
+            indexeds = FindSymbols('indexeds').visit(tree.root)
+            ondevice, onhost = split(indexeds, lambda i: is_ondevice(i, self.device_fit))
+            if not onhost:
+                continue
+
+            # What Function's should be copied back to the host?
+            # TODO: no data dependence analysis is performed, so all on-device
+            # Function`s`, including the read-only ones, will be copied back
+            for indexed in ondevice:
+                f = indexed.function
+                assert root.dim in f.dimensions
+                if f.is_DiscreteFunction:
+                    n = f.dimensions.index(root.dim)
+                    datamap = indexed.indices[:n] + (FULL,)*len(indexed.indices[n:])
+                    mapper[root].add((f, tuple(datamap)))
+
+        
+                    from IPython import embed; embed()
+            mapper[root] = HostParallelIteration(**root.args)
+
+
+        iet = Transformer(mapper, nested=True).visit(iet)
+
+        parfor = make_host_parallel_for(self.nthreads)
+
+
+        return iet, {'efuncs': [parfor], 'args': [self.nthreads],
+                     'includes': ('vector', 'thread', 'algorithm')}
 
 
 class DeviceOpenMPDataManager(DataManager):
@@ -466,7 +465,6 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         # Symbol definitions
         data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
-        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -498,7 +496,6 @@ class DeviceOpenMPOperator(DeviceOpenMPNoopOperator):
         # Symbol definitions
         data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
-        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -569,7 +566,6 @@ class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
         # Symbol definitions
         data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
-        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -591,14 +587,3 @@ def is_ondevice(maybe_symbol, device_fit):
 
     return all(not (f.is_TimeFunction and f.save is not None and f not in device_fit)
                for f in functions)
-
-
-class CallParfor(Call):
-
-    def __init__(self, iteration):
-        super().__init__('parallel_for', [
-            iteration.symbolic_min,
-            iteration.symbolic_max,
-            Lambda(iteration.nodes, ['='], [iteration.dim])
-        ])
-        self.iteration = iteration
