@@ -10,7 +10,7 @@ from devito.core.operator import OperatorCore
 from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
-from devito.ir.iet import (Call, Callable, ElementalFunction, Expression,
+from devito.ir.iet import (Call, Callable, Conditional, ElementalFunction, Expression,
                            List, LocalExpression, Iteration, While, FindNodes,
                            FindSymbols, MapExprStmts, MapNodes, Transformer,
                            retrieve_iteration_tree, filter_iterations)
@@ -24,7 +24,7 @@ from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                iet_pass)
 from devito.symbolics import Byref, FieldFromComposite, InlineIf
 from devito.tools import as_tuple, filter_ordered, filter_sorted, split, timed_pass
-from devito.types import Dimension, LocalObject, Symbol
+from devito.types import Array, CustomDimension, Dimension, LocalObject, Symbol
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
@@ -241,54 +241,76 @@ class HostParallelizer(object):
 
         return None, None
 
-    def _make_lock(self, wmetadata):
-        name = self.sregistry.make_name(prefix='devicelock')
-
-        require_lock = []
+    def _make_locks(self, wmetadata, known_locks):
+        retval = {}
         for f, datamaps in wmetadata.items():
-            for datamap in datamaps:
-                for d, i in zip(f.dimensions, datamap):
-                    if i is FULL:
-                        break
-                    else:
-                        from IPython import embed; embed()
-                require_lock.extend([i for i in datamap if i is not FULL])
-
-        for i in filter_ordered(require_lock):
-            if i.is_Modulo:
-                from IPython import embed; embed()
+            if f in known_locks:
+                retval[f] = known_locks[f]
             else:
-                raise NotImplementedError
+                name = self.sregistry.make_name(prefix='%s_lock' % f.name)
 
-        return Array(name=name, dimensions=dimensions)
+                dims = []
+                for datamap in datamaps:
+                    for d, s, i in zip(f.dimensions, f.shape, datamap):
+                        if i is FULL:
+                            break
+                        elif d.is_Stepping:
+                            dims.append(CustomDimension(name=d.name, symbolic_size=s))
+                        else:
+                            dims.append(d)
+
+                retval[f] = Array(name=name, dimensions=dims)
+
+        return retval
+
+    def _make_guarded_wnext(self, wnext, wmetadata, locks):
+        for f, datamaps in wmetadata.items():
+            lock = locks[f]
+            from IPython import embed; embed()
+
+        retval = List(haeder=c.Comment("Wait for `%s` to be copied to the host" %
+                                       ",".join(i.name for i in reads)),
+                      body=While())
+
+        return retval
+
+    def _make_guarded_root(self, root, rmetadata, locks):
+        from IPython import embed; embed()
+
+        retval = HostParallelIteration(**root.args)
+
+        return retval
 
     @iet_pass
     def make_parallel(self, iet):
         trees = retrieve_iteration_tree(iet)
 
-        mapper = self._find_candidates(trees)
-
-        for root, rmetadata in mapper.items():
+        mapper = {}
+        locks = {}
+        for root, rmetadata in self._find_candidates(trees).items():
             reads = set(rmetadata)
             wnext, wmetadata = self._find_next_write(root, reads, trees)
             if wnext is None:
                 continue
 
-            lock = self._make_lock(wmetadata)
-            List(haeder=c.Comment("Wait for `%s` to be copied to the host" %
-                                  ",".join(i.name for i in reads)),
-                 body=While())
-            from IPython import embed; embed()
+            locks = self._make_locks(wmetadata, locks)
 
-            subs[root] = HostParallelIteration(**root.args)
+            # Guard `wnext`
+            wnext = mapper.get(wnext, wnext)
+            mapper[wnext] = self._make_guarded_wnext(wnext, wmetadata, locks)
+
+            # Guard `root`
+            mapper[root] = self._make_guarded_root(root, rmetadata, locks)
 
         iet = Transformer(mapper, nested=True).visit(iet)
 
-        parfor = make_host_parallel_for(self.nthreads)
+        # Make sure we wait for the termination of the host thread
+        iet = iet  #TODO
 
+        # Add all necessary local variable definitions
+        args = [self.nthreads]  #TODO
 
-        return iet, {'efuncs': [parfor], 'args': [self.nthreads],
-                     'includes': ('vector', 'thread', 'algorithm')}
+        return iet, {'efuncs': [parfor], 'args': args, 'includes': ['thread']}
 
 
 class DeviceOpenMPDataManager(DataManager):
