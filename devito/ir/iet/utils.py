@@ -14,6 +14,15 @@ def retrieve_iteration_tree(node, mode='normal'):
     """
     A list with all Iteration sub-trees within an IET.
 
+    Parameters
+    ----------
+    iet : Node
+        The searched Iteration/Expression tree.
+    mode : str, optional
+        - ``normal``
+        - ``superset``: Iteration trees that are subset of larger iteration trees
+                        are dropped.
+
     Examples
     --------
     Given the Iteration tree:
@@ -23,23 +32,14 @@ def retrieve_iteration_tree(node, mode='normal'):
            Iteration i
              expr0
              Iteration j
-               Iteraion k
+               Iteration k
                  expr1
              Iteration p
                expr2
 
-    Return the list: ::
+    Return the list:
 
         [(Iteration i, Iteration j, Iteration k), (Iteration i, Iteration p)]
-
-    Parameters
-    ----------
-    iet : Node
-        The searched Iteration/Expression tree.
-    mode : str, optional
-        - ``normal``
-        - ``superset``: Iteration trees that are subset of larger iteration trees
-                        are dropped.
     """
     assert mode in ('normal', 'superset')
 
