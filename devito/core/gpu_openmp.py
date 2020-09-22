@@ -22,7 +22,7 @@ from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_i
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
-from devito.symbolics import Byref, FieldFromComposite, InlineIf
+from devito.symbolics import Byref, CondEq, FieldFromComposite
 from devito.tools import as_tuple, filter_ordered, filter_sorted, split, timed_pass
 from devito.types import Array, CustomDimension, Dimension, LocalObject, Symbol
 
@@ -189,7 +189,8 @@ class HostParallelizer(object):
 
             assert root.dim in f.dimensions
             n = f.dimensions.index(root.dim)
-            datamap = indexed.indices[:n] + (FULL,)*len(indexed.indices[n:])
+            datamap = indexed.indices[:f.dimensions.index(root.dim)]
+
             mapper[indexed.function].add(tuple(datamap))
 
         return mapper
@@ -249,28 +250,35 @@ class HostParallelizer(object):
             else:
                 name = self.sregistry.make_name(prefix='%s_lock' % f.name)
 
+                assert len(datamaps) > 0
+                #TODO: IMPROVE ME
+                n = len(set(datamaps).pop())
+
                 dims = []
-                for datamap in datamaps:
-                    for d, s, i in zip(f.dimensions, f.shape, datamap):
-                        if i is FULL:
-                            break
-                        elif d.is_Stepping:
-                            dims.append(CustomDimension(name=d.name, symbolic_size=s))
-                        else:
-                            dims.append(d)
+                for d, s in zip(f.dimensions[:n], f.shape[:n]):
+                    if d.is_Stepping:
+                        dims.append(CustomDimension(name=d.name, symbolic_size=s))
+                    else:
+                        dims.append(d)
 
                 retval[f] = Array(name=name, dimensions=dims)
 
         return retval
 
     def _make_guarded_wnext(self, wnext, wmetadata, locks):
+        conditions = []
         for f, datamaps in wmetadata.items():
-            lock = locks[f]
-            from IPython import embed; embed()
+            conditions.append(sympy.And(*[CondEq(locks[f][i], 0) for i in datamaps]))
+        condition = sympy.And(*conditions)
 
-        retval = List(haeder=c.Comment("Wait for `%s` to be copied to the host" %
-                                       ",".join(i.name for i in reads)),
-                      body=While())
+        guard = List(
+            header=c.Comment("Wait for `%s` to be copied to the host" %
+                             ",".join(i.name for i in wmetadata)),
+            body=While(condition),
+            footer=c.Line(""),
+        )
+
+        retval = List(body=[guard, wnext])
 
         return retval
 
