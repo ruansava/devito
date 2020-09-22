@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from functools import partial, singledispatch
 
 from ctypes import c_void_p
@@ -10,8 +10,8 @@ from devito.core.operator import OperatorCore
 from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
-from devito.ir.iet import (Call, Callable, ElementalFunction, Expression,
-                           Lambda, List, LocalExpression, Iteration, FindNodes,
+from devito.ir.iet import (Call, Callable, Conditional, ElementalFunction, Expression,
+                           List, LocalExpression, Iteration, While, FindNodes,
                            FindSymbols, MapExprStmts, MapNodes, Transformer,
                            retrieve_iteration_tree, filter_iterations)
 from devito.ir.support import Scope
@@ -22,9 +22,9 @@ from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_i
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
-from devito.symbolics import Byref, FieldFromComposite, InlineIf
-from devito.tools import as_tuple, filter_sorted, split, timed_pass
-from devito.types import Dimension, LocalObject, Symbol
+from devito.symbolics import Byref, CondEq, FieldFromComposite
+from devito.tools import as_tuple, filter_ordered, filter_sorted, split, timed_pass
+from devito.types import Array, CustomDimension, Dimension, LocalObject, Symbol
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
@@ -158,28 +158,12 @@ class DeviceOmpizer(Ompizer):
         return partree
 
 
-class HostParallelIteration(List):
+class HostParallelIteration(OpenMPIteration):
+    pass
 
-    # Can be used anywhere an Iteration is expected
-    is_Iteration = True
 
-    def __init__(self, body, pragmas=None):
-        # `body` may be a tuple of length 1 upon reconstruction
-        body = as_tuple(body)
-        assert len(body) == 1
-        body = body[0]
-        if isinstance(body, CallParfor):
-            super().__init__(header=pragmas, body=body)
-        else:
-            assert body.is_Iteration
-            super().__init__(header=pragmas, body=CallParfor(body))
-
-    def __getattr__(self, name):
-        return getattr(self.iteration, name)
-
-    @property
-    def iteration(self):
-        return self.body[0].iteration
+DataMap = namedtuple('DataMap', 'iterator symbolic_size')
+#TODO: DataMap -> IterMap
 
 
 class HostParallelizer(object):
@@ -192,27 +176,149 @@ class HostParallelizer(object):
     def nthreads(self):
         return self.sregistry.nthreads
 
-    @iet_pass
-    def make_parallel(self, iet):
-        key = lambda i: i.is_Parallel and not is_ondevice(i, self.device_fit)
+    def _make_datamaps(self, indexeds, root):
+        """
+        Build a datamap for the Indexed's in a tree. A datamap is used to
+        distinguish parallel from sequential Dimensions.
+        """
+        mapper = defaultdict(set)
+        for indexed in indexeds:
+            f = indexed.function
+            if not f.is_DiscreteFunction:
+                continue
 
+            assert root.dim in f.dimensions
+            n = f.dimensions.index(root.dim)
+            datamap = indexed.indices[:f.dimensions.index(root.dim)]
+
+            mapper[indexed.function].add(tuple(datamap))
+
+        return mapper
+
+    def _find_candidates(self, trees):
+        """
+        Detect all candidate HostParallelIteration's. Also collect metadata.
+        """
         mapper = {}
-        for tree in retrieve_iteration_tree(iet):
-            candidates = filter_iterations(tree, key=key)
+        for tree in trees:
+            # If already offloaded to the device, ignore
+            if any(isinstance(i, DeviceOpenMPIteration) for i in tree):
+                continue
+
+            # Pick up the `root` of the potential HostParallelIteration
+            candidates = filter_iterations(tree, key=lambda i: i.is_Parallel)
             if not candidates:
                 continue
             root = candidates[0]
             if root in mapper:
                 continue
-            mapper[root] = HostParallelIteration(root)
 
-        if mapper:
-            iet = Transformer(mapper, nested=True).visit(iet)
-            parfor = make_host_parallel_for(self.nthreads)
-            return iet, {'efuncs': [parfor], 'args': [self.nthreads],
-                         'includes': ('vector', 'thread', 'algorithm')}
-        else:
-            return iet, {}
+            indexeds = FindSymbols('indexeds').visit(tree.root)
+            ondevice, onhost = split(indexeds, lambda i: is_ondevice(i, self.device_fit))
+            if not onhost:
+                continue
+
+            # Get the Function's that, if written, will have to be copied to the host
+            mapper[root] = self._make_datamaps(ondevice, root)
+
+        return mapper
+
+    def _find_next_write(self, root, reads, trees):
+        """
+        Return the closest tree performing a write to the Function's read in ``root``.
+        Also collect metadata.
+        """
+        for tree in sorted(trees, key=lambda i: root in i, reverse=True):
+            if root in tree:
+                continue
+
+            for i in tree:
+                if isinstance(i, DeviceOpenMPIteration):
+                    indexeds = [e.output for e in FindNodes(Expression).visit(i)]
+                    if not any(idx.function in reads for idx in indexeds):
+                        break
+
+                    return i, self._make_datamaps(indexeds, i)
+
+        return None, None
+
+    def _make_locks(self, wmetadata, known_locks):
+        retval = {}
+        for f, datamaps in wmetadata.items():
+            if f in known_locks:
+                retval[f] = known_locks[f]
+            else:
+                name = self.sregistry.make_name(prefix='%s_lock' % f.name)
+
+                assert len(datamaps) > 0
+                #TODO: IMPROVE ME
+                n = len(set(datamaps).pop())
+
+                dims = []
+                for d, s in zip(f.dimensions[:n], f.shape[:n]):
+                    if d.is_Stepping:
+                        dims.append(CustomDimension(name=d.name, symbolic_size=s))
+                    else:
+                        dims.append(d)
+
+                retval[f] = Array(name=name, dimensions=dims)
+
+        return retval
+
+    def _make_guarded_wnext(self, wnext, wmetadata, locks):
+        conditions = []
+        for f, datamaps in wmetadata.items():
+            conditions.append(sympy.And(*[CondEq(locks[f][i], 0) for i in datamaps]))
+        condition = sympy.And(*conditions)
+
+        guard = List(
+            header=c.Comment("Wait for `%s` to be copied to the host" %
+                             ",".join(i.name for i in wmetadata)),
+            body=While(condition),
+            footer=c.Line(""),
+        )
+
+        retval = List(body=[guard, wnext])
+
+        return retval
+
+    def _make_guarded_root(self, root, rmetadata, locks):
+        from IPython import embed; embed()
+
+        retval = HostParallelIteration(**root.args)
+
+        return retval
+
+    @iet_pass
+    def make_parallel(self, iet):
+        trees = retrieve_iteration_tree(iet)
+
+        mapper = {}
+        locks = {}
+        for root, rmetadata in self._find_candidates(trees).items():
+            reads = set(rmetadata)
+            wnext, wmetadata = self._find_next_write(root, reads, trees)
+            if wnext is None:
+                continue
+
+            locks = self._make_locks(wmetadata, locks)
+
+            # Guard `wnext`
+            wnext = mapper.get(wnext, wnext)
+            mapper[wnext] = self._make_guarded_wnext(wnext, wmetadata, locks)
+
+            # Guard `root`
+            mapper[root] = self._make_guarded_root(root, rmetadata, locks)
+
+        iet = Transformer(mapper, nested=True).visit(iet)
+
+        # Make sure we wait for the termination of the host thread
+        iet = iet  #TODO
+
+        # Add all necessary local variable definitions
+        args = [self.nthreads]  #TODO
+
+        return iet, {'efuncs': [parfor], 'args': args, 'includes': ['thread']}
 
 
 class DeviceOpenMPDataManager(DataManager):
@@ -466,7 +572,6 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         # Symbol definitions
         data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
-        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -498,7 +603,6 @@ class DeviceOpenMPOperator(DeviceOpenMPNoopOperator):
         # Symbol definitions
         data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
-        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -569,7 +673,6 @@ class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
         # Symbol definitions
         data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
-        data_manager.place_onhost(graph)
         data_manager.place_definitions(graph)
         data_manager.place_casts(graph)
 
@@ -591,14 +694,3 @@ def is_ondevice(maybe_symbol, device_fit):
 
     return all(not (f.is_TimeFunction and f.save is not None and f not in device_fit)
                for f in functions)
-
-
-class CallParfor(Call):
-
-    def __init__(self, iteration):
-        super().__init__('parallel_for', [
-            iteration.symbolic_min,
-            iteration.symbolic_max,
-            Lambda(iteration.nodes, ['='], [iteration.dim])
-        ])
-        self.iteration = iteration
