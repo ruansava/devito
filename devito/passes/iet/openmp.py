@@ -522,12 +522,27 @@ class Ompizer(object):
 
         return iet, {'args': args, 'includes': ['omp.h']}
 
+    def _make_orchestration(self, iet):
+        """
+        A stub for subclasses which use OpenMP for hybrid execution (e.g., one
+        thread drives the host, another thread the device).
+        """
+        return iet, {}
+
     @iet_pass
     def make_parallel(self, iet):
         """
         Create a new IET with shared-memory parallelism via OpenMP pragmas.
         """
-        return self._make_parallel(iet)
+        iet, metadata0 = self._make_parallel(iet)
+        iet, metadata1 = self._make_orchestration(iet)
+
+        metadata = defaultdict(list)
+        for m in [metadata0, metadata1]:
+            for k, v in m.items():
+                metadata[k].extend(v)
+
+        return iet, metadata
 
     @iet_pass
     def make_simd(self, iet, **kwargs):
