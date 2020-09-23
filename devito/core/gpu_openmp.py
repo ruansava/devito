@@ -13,7 +13,7 @@ from devito.ir.equations import DummyEq
 from devito.ir.iet import (Call, Callable, Conditional, ElementalFunction, Expression,
                            List, LocalExpression, Iteration, While, FindNodes,
                            FindSymbols, MapExprStmts, Transformer, filter_iterations,
-                           retrieve_iteration_tree)
+                           make_efunc, retrieve_iteration_tree)
 from devito.logger import warning
 from devito.mpi.routines import CopyBuffer, SendRecv, HaloUpdate
 from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_increments,
@@ -21,7 +21,7 @@ from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_i
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
-from devito.symbolics import Byref, CondEq, FieldFromComposite
+from devito.symbolics import Byref, CondEq, DefFunction, FieldFromComposite
 from devito.tools import as_tuple, filter_ordered, filter_sorted, split, timed_pass
 from devito.types import Array, CustomDimension, Dimension, LocalObject, Symbol
 
@@ -177,25 +177,36 @@ class DeviceOmpizer(Ompizer):
 
             # Get the Function's that, if written, will have to be copied to the host
             rmetadata = self._make_datamaps(ondevice, partree)
-            reads = set(rmetadata)
 
-            wnext, wmetadata = self._find_next_write(partree, partrees, reads)
-            if wnext is None:
-                continue
-
-            wmapper[wnext].update(wmetadata)
             rmapper[partree].update(rmetadata)
 
+            # Get the closest tree performing a write to any of the Function's read
+            # in ``partree``.
+            wnext = None
+            wmetadata = None
+            for i in sorted(partrees, key=lambda i: partree is i, reverse=True):
+                if not isinstance(i.root, DeviceOpenMPIteration):
+                    continue
+
+                indexeds = [e.output for e in FindNodes(Expression).visit(i)]
+                if not any(idx.function in set(rmetadata) for idx in indexeds):
+                    continue
+
+                # Found!
+                wmapper[i].update(self._make_datamaps(indexeds, i))
+
+                break
+
+        efuncs = []
         mapper = {}
-        locks = {}
+        locks = Locks(self.sregistry.make_name)
 
         # Protect `wnext` from race conditions
         for wnext, wmetadata in wmapper.items():
             conditions = []
             for f, datamaps in wmetadata.items():
                 for i in datamaps:
-                    lock = self._make_default_lock(f, i, locks)
-                    conditions.append(CondEq(lock, 0))
+                    conditions.append(CondEq(locks.makedefault(f, i), 0))
             condition = sympy.And(*conditions)
             body = List(header=c.Comment("Wait for `%s` to be copied to the host" %
                                          ",".join(i.name for i in wmetadata)),
@@ -203,35 +214,43 @@ class DeviceOmpizer(Ompizer):
                         footer=c.Line(""))
             mapper[wnext] = wnext._rebuild(prefix=(body,) + wnext.prefix)
 
+        # The host partrees will be executed by another thread asynchronously
+        threadhost = STDThread('thread')
+        theadwait = List(
+            header=[c.Line(""), c.Comment("Wait for completion of host thread")],
+            body=Conditional(DefFunction(FieldFromComposite('joinable', threadhost.name)),
+                             Call(FieldFromComposite('join', threadhost.name)))
+        )
+
         # Protect `partree` from race conditions and add in pragmas for data copy
-        for partree, rmetadata in rmapper.items():
+        for n, (partree, rmetadata) in enumerate(rmapper.items()):
             copies = []
             body = []
             for f, datamaps in rmetadata.items():
                 for i in datamaps:
-                    lock = self._make_default_lock(f, i, locks)
-                    body.append(Expression(DummyEq(lock, 1)))
+                    body.append(Expression(DummyEq(locks.makedefault(f, i), 1)))
                     copies.append(self._map_update_host(f, i))
             header = [c.Line(""), c.Comment("Device can now write again to `%s`"
                                             % ",".join(i.name for i in rmetadata))]
             body = List(header=copies + header, body=body, footer=c.Line(""))
-            mapper[partree] = partree._rebuild(prefix=(body,) + partree.prefix)
+            rebuilt = partree._rebuild(prefix=(body,) + partree.prefix)
+
+            # Turn it into an ElementalFunction
+            efunc = make_efunc('copy_device_to_host%d' % n, rebuilt)
+            call = efunc.make_call()
+            #TODO: add `threadwait`
+            #TODO: add devicemask[t1] = 0;
+            #TODO: make it `thread = <call>`
+
+            from IPython import embed; embed()
+
+            efuncs.append(efunc)
+            mapper[partree] = rebuilt
 
         iet = Transformer(mapper).visit(iet)
-        from IPython import embed; embed()
 
-        # A master thread is in charge of performing fork-join actions
-        # Typically there's just one master thread, but on heterogeneous systems
-        # (e.g., mixed host-device execution) there could be more
-        #TODO
-        masters = None
-
-        # Add in tear-down statements
-        #TODO
-        # if(thread.joinable()) {
-        #   thread.join();
-        # }
-        iet = iet
+        # Make sure we don't jump back to Python-land until the host thread is done
+        iet = iet._rebuild(body=iet.body + (threadwait,))
 
         # Add all necessary local variable definitions
         args = [self.nthreads]  #TODO
@@ -244,6 +263,7 @@ class DeviceOmpizer(Ompizer):
         distinguish parallel from sequential Dimensions.
         """
         #TODO: Rewrite docstring
+        #TODO: move to utils function?
         mapper = defaultdict(set)
         for indexed in indexeds:
             f = indexed.function
@@ -257,46 +277,6 @@ class DeviceOmpizer(Ompizer):
             mapper[indexed.function].add(tuple(datamap))
 
         return mapper
-
-    def _find_next_write(self, partree, partrees, reads):
-        """
-        Return the closest tree performing a write to the Function's read in ``partree``.
-        Also collect metadata.
-        """
-        #TODO: improve me
-        for i in sorted(partrees, key=lambda i: partree is i, reverse=True):
-            if not isinstance(i.root, DeviceOpenMPIteration):
-                continue
-
-            indexeds = [e.output for e in FindNodes(Expression).visit(i)]
-            if not any(idx.function in reads for idx in indexeds):
-                break
-
-            return i, self._make_datamaps(indexeds, i)
-
-        return None, None
-
-    def _make_default_lock(self, f, datamap, locks):
-        """
-        Create a new lock for `f` if non existant already; then return a lock for `f`.
-        """
-        # The lock-protected Dimension's
-        locked = [i for i in datamap if i is not FULL]
-
-        if f not in locks:
-            name = self.sregistry.make_name(prefix='%s_lock' % f.name)
-
-            n = len(locked)
-            dims = []
-            for d, s in zip(f.dimensions[:n], f.shape[:n]):
-                if d.is_Stepping:
-                    dims.append(CustomDimension(name=d.name, symbolic_size=s))
-                else:
-                    dims.append(d)
-
-            locks[f] = Array(name=name, dimensions=dims)
-
-        return locks[f][locked]
 
 
 class DeviceOpenMPDataManager(DataManager):
@@ -632,3 +612,45 @@ def is_ondevice(maybe_symbol, device_fit):
 
     return all(not (f.is_TimeFunction and f.save is not None and f not in device_fit)
                for f in functions)
+
+
+class STDThread(LocalObject):
+    dtype = type('std::thread', (c_void_p,), {}) 
+
+    def __init__(self, name):
+        self.name = name
+
+    # Pickling support
+    _pickle_args = ['name']
+
+
+class Locks(dict):
+
+    """
+    A simple mapper between Function's and locks to make sure we have
+    a unique lock per Function.
+    """
+
+    def __init__(self, make_name, *args, **kwargs):
+        self.make_name = make_name
+        super().__init__(*args, **kwargs)
+
+    def makedefault(self, f, datamap):
+        # The lock-protected Dimension's
+        locked = [i for i in datamap if i is not FULL]
+
+        if f not in self:
+            name = self.make_name(prefix='%s_lock' % f.name)
+
+            n = len(locked)
+            dims = []
+            for d, s in zip(f.dimensions[:n], f.shape[:n]):
+                if d.is_Stepping:
+                    dims.append(CustomDimension(name=d.name, symbolic_size=s))
+                else:
+                    dims.append(d)
+
+            #TODO: MAKE IT volatile int !!!
+            self[f] = Array(name=name, dimensions=dims, dtype=np.int32)
+
+        return self[f][locked]
