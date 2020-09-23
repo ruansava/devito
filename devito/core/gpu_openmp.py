@@ -12,9 +12,8 @@ from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import (Call, Callable, Conditional, ElementalFunction, Expression,
                            List, LocalExpression, Iteration, While, FindNodes,
-                           FindSymbols, MapExprStmts, MapNodes, Transformer,
-                           retrieve_iteration_tree, filter_iterations)
-from devito.ir.support import Scope
+                           FindSymbols, MapExprStmts, Transformer, filter_iterations,
+                           retrieve_iteration_tree)
 from devito.logger import warning
 from devito.mpi.routines import CopyBuffer, SendRecv, HaloUpdate
 from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_increments,
@@ -40,6 +39,10 @@ class DeviceOpenMPIteration(OpenMPIteration):
     def _make_clauses(cls, **kwargs):
         kwargs['chunk_size'] = False
         return super(DeviceOpenMPIteration, cls)._make_clauses(**kwargs)
+
+
+class HostParallelIteration(OpenMPIteration):
+    pass
 
 
 class DeviceOmpizer(Ompizer):
@@ -130,20 +133,23 @@ class DeviceOmpizer(Ompizer):
         assert candidates
         root = candidates[0]
 
-        # Get the collapsable Iterations
-        collapsable = self._find_collapsable(root, candidates)
-        ncollapse = 1 + len(collapsable)
-
         if is_ondevice(root, self.device_fit):
             # The typical case: all accessed Function's are device Function's, that is
             # all Function's are in the device memory. Then we offload the candidate
             # Iterations to the device
+
+            # Get the collapsable Iterations
+            collapsable = self._find_collapsable(root, candidates)
+            ncollapse = 1 + len(collapsable)
+
             body = self._Iteration(ncollapse=ncollapse, **root.args)
             partree = ParallelTree([], body, nthreads=nthreads)
             collapsed = [partree] + collapsable
+
             return root, partree, collapsed
         else:
-            return root, None, None
+            # Resort to host parallelism
+            return super()._make_partree(candidates, nthreads)
 
     def _make_parregion(self, partree, *args):
         # no-op for now
@@ -157,26 +163,87 @@ class DeviceOmpizer(Ompizer):
         # no-op for now
         return partree
 
+    def _make_orchestration(self, iet):
+        partrees = FindNodes(ParallelTree).visit(iet)
 
-class HostParallelIteration(OpenMPIteration):
-    pass
+        wmapper = defaultdict(dict)
+        rmapper = defaultdict(dict)
+        for partree in partrees:
+            if type(partree.root) != OpenMPIteration:
+                continue
 
+            indexeds = FindSymbols('indexeds').visit(partree)
+            ondevice = [i for i in indexeds if is_ondevice(i, self.device_fit)]
 
-class HostParallelizer(object):
+            # Get the Function's that, if written, will have to be copied to the host
+            rmetadata = self._make_datamaps(ondevice, partree)
+            reads = set(rmetadata)
 
-    def __init__(self, sregistry, options):
-        self.sregistry = sregistry
-        self.device_fit = options['device-fit']
+            wnext, wmetadata = self._find_next_write(partree, partrees, reads)
+            if wnext is None:
+                continue
 
-    @property
-    def nthreads(self):
-        return self.sregistry.nthreads
+            wmapper[wnext].update(wmetadata)
+            rmapper[partree].update(rmetadata)
+
+        mapper = {}
+        locks = {}
+
+        # Protect `wnext` from race conditions
+        for wnext, wmetadata in wmapper.items():
+            conditions = []
+            for f, datamaps in wmetadata.items():
+                for i in datamaps:
+                    lock = self._make_default_lock(f, i, locks)
+                    conditions.append(CondEq(lock, 0))
+            condition = sympy.And(*conditions)
+            body = List(header=c.Comment("Wait for `%s` to be copied to the host" %
+                                         ",".join(i.name for i in wmetadata)),
+                        body=While(condition),
+                        footer=c.Line(""))
+            mapper[wnext] = wnext._rebuild(prefix=(body,) + wnext.prefix)
+
+        # Protect `partree` from race conditions and add in pragmas for data copy
+        for partree, rmetadata in rmapper.items():
+            copies = []
+            body = []
+            for f, datamaps in rmetadata.items():
+                for i in datamaps:
+                    lock = self._make_default_lock(f, i, locks)
+                    body.append(Expression(DummyEq(lock, 1)))
+                    copies.append(self._map_update_host(f, i))
+            header = [c.Line(""), c.Comment("Device can now write again to `%s`"
+                                            % ",".join(i.name for i in rmetadata))]
+            body = List(header=copies + header, body=body, footer=c.Line(""))
+            mapper[partree] = partree._rebuild(prefix=(body,) + partree.prefix)
+
+        iet = Transformer(mapper).visit(iet)
+        from IPython import embed; embed()
+
+        # A master thread is in charge of performing fork-join actions
+        # Typically there's just one master thread, but on heterogeneous systems
+        # (e.g., mixed host-device execution) there could be more
+        #TODO
+        masters = None
+
+        # Add in tear-down statements
+        #TODO
+        # if(thread.joinable()) {
+        #   thread.join();
+        # }
+        iet = iet
+
+        # Add all necessary local variable definitions
+        args = [self.nthreads]  #TODO
+
+        return iet, {'efuncs': [parfor], 'args': args, 'includes': ['thread']}
 
     def _make_datamaps(self, indexeds, root):
         """
         Build a datamap for the Indexed's in a tree. A datamap is used to
         distinguish parallel from sequential Dimensions.
         """
+        #TODO: Rewrite docstring
         mapper = defaultdict(set)
         for indexed in indexeds:
             f = indexed.function
@@ -185,146 +252,51 @@ class HostParallelizer(object):
 
             assert root.dim in f.dimensions
             n = f.dimensions.index(root.dim)
-            datamap = indexed.indices[:f.dimensions.index(root.dim)]
+            datamap = indexed.indices[:n] + (FULL,)*len(indexed.indices[n:])
 
             mapper[indexed.function].add(tuple(datamap))
 
         return mapper
 
-    def _find_candidates(self, trees):
+    def _find_next_write(self, partree, partrees, reads):
         """
-        Detect all candidate HostParallelIteration's. Also collect metadata.
-        """
-        mapper = {}
-        for tree in trees:
-            # If already offloaded to the device, ignore
-            if any(isinstance(i, DeviceOpenMPIteration) for i in tree):
-                continue
-
-            # Pick up the `root` of the potential HostParallelIteration
-            candidates = filter_iterations(tree, key=lambda i: i.is_Parallel)
-            if not candidates:
-                continue
-            root = candidates[0]
-            if root in mapper:
-                continue
-
-            indexeds = FindSymbols('indexeds').visit(root)
-            ondevice, onhost = split(indexeds, lambda i: is_ondevice(i, self.device_fit))
-            if not onhost:
-                continue
-
-            # Get the Function's that, if written, will have to be copied to the host
-            mapper[root] = self._make_datamaps(ondevice, root)
-
-        return mapper
-
-    def _find_next_write(self, root, reads, trees):
-        """
-        Return the closest tree performing a write to the Function's read in ``root``.
+        Return the closest tree performing a write to the Function's read in ``partree``.
         Also collect metadata.
         """
-        for tree in sorted(trees, key=lambda i: root in i, reverse=True):
-            if root in tree:
+        #TODO: improve me
+        for i in sorted(partrees, key=lambda i: partree is i, reverse=True):
+            if not isinstance(i.root, DeviceOpenMPIteration):
                 continue
 
-            for i in tree:
-                if isinstance(i, DeviceOpenMPIteration):
-                    indexeds = [e.output for e in FindNodes(Expression).visit(i)]
-                    if not any(idx.function in reads for idx in indexeds):
-                        break
+            indexeds = [e.output for e in FindNodes(Expression).visit(i)]
+            if not any(idx.function in reads for idx in indexeds):
+                break
 
-                    return i, self._make_datamaps(indexeds, i)
+            return i, self._make_datamaps(indexeds, i)
 
         return None, None
 
-    def _make_locks(self, wmetadata, known_locks):
-        retval = {}
-        for f, datamaps in wmetadata.items():
-            if f in known_locks:
-                retval[f] = known_locks[f]
-            else:
-                name = self.sregistry.make_name(prefix='%s_lock' % f.name)
+    def _make_default_lock(self, f, datamap, locks):
+        """
+        Create a new lock for `f` if non existant already; then return a lock for `f`.
+        """
+        # The lock-protected Dimension's
+        locked = [i for i in datamap if i is not FULL]
 
-                assert len(datamaps) > 0
-                #TODO: IMPROVE ME
-                n = len(set(datamaps).pop())
+        if f not in locks:
+            name = self.sregistry.make_name(prefix='%s_lock' % f.name)
 
-                dims = []
-                for d, s in zip(f.dimensions[:n], f.shape[:n]):
-                    if d.is_Stepping:
-                        dims.append(CustomDimension(name=d.name, symbolic_size=s))
-                    else:
-                        dims.append(d)
+            n = len(locked)
+            dims = []
+            for d, s in zip(f.dimensions[:n], f.shape[:n]):
+                if d.is_Stepping:
+                    dims.append(CustomDimension(name=d.name, symbolic_size=s))
+                else:
+                    dims.append(d)
 
-                retval[f] = Array(name=name, dimensions=dims)
+            locks[f] = Array(name=name, dimensions=dims)
 
-        return retval
-
-    def _make_guarded_wnext(self, wnext, wmetadata, locks):
-        conditions = []
-        for f, datamaps in wmetadata.items():
-            conditions.append(sympy.And(*[CondEq(locks[f][i], 0) for i in datamaps]))
-        condition = sympy.And(*conditions)
-
-        guard = List(
-            header=c.Comment("Wait for `%s` to be copied to the host" %
-                             ",".join(i.name for i in wmetadata)),
-            body=While(condition),
-            footer=c.Line(""),
-        )
-
-        retval = List(body=[guard, wnext])
-
-        return retval
-
-    def _make_guarded_root(self, root, rmetadata, locks):
-        body = []
-        for f, datamaps in rmetadata.items():
-            for i in datamaps:
-                body.append(LocalExpression(DummyEq(locks[f][i], 1)))
-
-        body = List(header=[c.Line(""),
-                            c.Comment("Device can now write again to `%s`"
-                                      % ",".join(i.name for i in rmetadata))],
-                    body=body,
-                    footer=c.Line(""))
-        from IPython import embed; embed()
-
-        retval = HostParallelIteration(**root.args)
-
-        return retval
-
-    @iet_pass
-    def make_parallel(self, iet):
-        trees = retrieve_iteration_tree(iet)
-
-        mapper = {}
-        locks = {}
-        for root, rmetadata in self._find_candidates(trees).items():
-            reads = set(rmetadata)
-            wnext, wmetadata = self._find_next_write(root, reads, trees)
-            if wnext is None:
-                continue
-
-            locks = self._make_locks(wmetadata, locks)
-
-            # Guard `wnext`
-            wnext = mapper.get(wnext, wnext)
-            mapper[wnext] = self._make_guarded_wnext(wnext, wmetadata, locks)
-
-            # Guard `root`
-            mapper[root] = self._make_guarded_root(root, rmetadata, locks)
-
-        iet = Transformer(mapper, nested=True).visit(iet)
-
-        # Make sure we wait for the termination of the host thread
-        iet = iet  #TODO
-
-        # Add all necessary local variable definitions
-        args = [self.nthreads]  #TODO
-
-        return iet, {'efuncs': [parfor], 'args': args, 'includes': ['thread']}
+        return locks[f][locked]
 
 
 class DeviceOpenMPDataManager(DataManager):
@@ -418,38 +390,6 @@ class DeviceOpenMPDataManager(DataManager):
             return iet
 
         iet = _place_ondevice(iet)
-
-        return iet, {}
-
-    @iet_pass
-    def place_onhost(self, iet):
-        # Analysis
-        mapper = defaultdict(set)
-        visitor = MapNodes(Iteration, HostParallelIteration, 'immediate')
-        for k, v in visitor.visit(iet).items():
-            #TODO: Check with test where len(ih) > 1
-
-            scope = Scope([e.expr for e in FindNodes(Expression).visit(k)])
-            for i in v:
-                ondevice, onhost = split(FindSymbols('indexeds').visit(i),
-                                         lambda i: is_ondevice(i, self.device_fit))
-                for indexed in ondevice:
-                    f = indexed.function
-                    assert i.dim in f.dimensions
-                    if f.is_DiscreteFunction and f in scope.writes:
-                        n = f.dimensions.index(i.dim)
-                        datamap = [idx for idx in indexed.indices[:n]]
-                        datamap.extend([FULL for _ in indexed.indices[n:]])
-                        mapper[i].add((f, tuple(datamap)))
-
-        # Post-process analysis
-        for k, v in list(mapper.items()):
-            onhost = [self._Parallelizer._map_update_host(f, dm) for f, dm in v]
-            mapper[k] = k._rebuild(pragmas=onhost)
-
-        # Transform the IET adding pragmas triggering a copy of the written data
-        # back to the host
-        iet = Transformer(mapper, nested=True).visit(iet)
 
         return iet, {}
 
@@ -572,9 +512,6 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         # GPU parallelism via OpenMP offloading
         DeviceOmpizer(sregistry, options).make_parallel(graph)
 
-        # Host parallelism via C++ parallel loops
-        HostParallelizer(sregistry, options).make_parallel(graph)
-
         # Symbol definitions
         data_manager = DeviceOpenMPDataManager(sregistry, options)
         data_manager.place_ondevice(graph)
@@ -600,9 +537,6 @@ class DeviceOpenMPOperator(DeviceOpenMPNoopOperator):
         # GPU parallelism via OpenMP offloading
         DeviceOmpizer(sregistry, options).make_parallel(graph)
 
-        # Host parallelism via C++ parallel loops
-        HostParallelizer(sregistry, options).make_parallel(graph)
-
         # Misc optimizations
         hoist_prodders(graph)
 
@@ -627,12 +561,10 @@ class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
         sregistry = kwargs['sregistry']
 
         ompizer = DeviceOmpizer(sregistry, options)
-        parizer = HostParallelizer(sregistry, options)
 
         return {
             'optcomms': partial(optimize_halospots),
             'openmp': partial(ompizer.make_parallel),
-            'c++par': partial(parizer.make_parallel),
             'mpi': partial(mpiize, mode=options['mpi']),
             'prodders': partial(hoist_prodders)
         }
