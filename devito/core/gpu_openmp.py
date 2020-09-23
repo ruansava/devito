@@ -1,4 +1,4 @@
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 from functools import partial, singledispatch
 
 from ctypes import c_void_p
@@ -125,7 +125,7 @@ class DeviceOmpizer(Ompizer):
     def _make_partree(self, candidates, nthreads=None):
         """
         Parallelize the `candidates` Iterations attaching suitable OpenMP pragmas
-        for GPU offloading.
+        for either device offloading or host parallelism.
         """
         assert candidates
         root = candidates[0]
@@ -160,10 +160,6 @@ class DeviceOmpizer(Ompizer):
 
 class HostParallelIteration(OpenMPIteration):
     pass
-
-
-DataMap = namedtuple('DataMap', 'iterator symbolic_size')
-#TODO: DataMap -> IterMap
 
 
 class HostParallelizer(object):
@@ -213,7 +209,7 @@ class HostParallelizer(object):
             if root in mapper:
                 continue
 
-            indexeds = FindSymbols('indexeds').visit(tree.root)
+            indexeds = FindSymbols('indexeds').visit(root)
             ondevice, onhost = split(indexeds, lambda i: is_ondevice(i, self.device_fit))
             if not onhost:
                 continue
@@ -283,6 +279,16 @@ class HostParallelizer(object):
         return retval
 
     def _make_guarded_root(self, root, rmetadata, locks):
+        body = []
+        for f, datamaps in rmetadata.items():
+            for i in datamaps:
+                body.append(LocalExpression(DummyEq(locks[f][i], 1)))
+
+        body = List(header=[c.Line(""),
+                            c.Comment("Device can now write again to `%s`"
+                                      % ",".join(i.name for i in rmetadata))],
+                    body=body,
+                    footer=c.Line(""))
         from IPython import embed; embed()
 
         retval = HostParallelIteration(**root.args)
