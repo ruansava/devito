@@ -1,7 +1,7 @@
 from collections import defaultdict
 from functools import partial, singledispatch
 
-from ctypes import c_void_p
+from ctypes import c_int, c_void_p
 import cgen as c
 import numpy as np
 import sympy
@@ -11,9 +11,9 @@ from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import (Call, Callable, Conditional, ElementalFunction, Expression,
-                           List, LocalExpression, Iteration, While, FindNodes,
-                           FindSymbols, MapExprStmts, Transformer, filter_iterations,
-                           make_efunc, retrieve_iteration_tree)
+                           List, LocalExpression, Iteration, While, Return, Continue,
+                           FindNodes, FindSymbols, MapExprStmts, Transformer,
+                           derive_parameters, filter_iterations, retrieve_iteration_tree)
 from devito.logger import warning
 from devito.mpi.routines import CopyBuffer, SendRecv, HaloUpdate
 from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_increments,
@@ -24,7 +24,8 @@ from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
 from devito.symbolics import (Byref, CondEq, DefFunction, FieldFromComposite,
                               ListInitializer)
 from devito.tools import as_tuple, filter_ordered, filter_sorted, split, timed_pass
-from devito.types import Array, CustomDimension, Dimension, LocalObject, Symbol
+from devito.types import (Array, CustomDimension, Dimension, LocalObject,
+                          LocalCompositeObject, Symbol)
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
@@ -219,62 +220,85 @@ class DeviceOmpizer(Ompizer):
                         footer=c.Line())
             mapper[wnext] = wnext._rebuild(prefix=(body,) + wnext.prefix)
 
-        # The `parregion` will be executed by another thread asynchronously
-        threadhost = STDThread('thread')
-        threadwait = List(
-            body=Conditional(DefFunction(FieldFromComposite('joinable', threadhost.name)),
-                             Call(FieldFromComposite('join', threadhost.name)))
+        threadwait = lambda thread: List(
+            body=Conditional(DefFunction(FieldFromComposite('joinable', thread.name)),
+                             Call(FieldFromComposite('join', thread.name)))
         )
 
         # Protect `parregion` from race conditions and add in pragmas for data copy
+        threads = []
         for n, (parregion, rimaskss) in enumerate(rmapper.items()):
+            # The `parregion` gets executed by another thread asynchronously
+            thread = STDThread('thread%d' % n)
+
+            # For this, we then have to turn `parregion` into an ElementalFunction
+            # We start off constructing the ElementalFunction body
             copies = []
-            setlock = []
             resetlock = []
             for f, imasks in rimaskss.items():
                 for i in imasks:
-                    lock = locks.makedefault(f, i)
-                    setlock.append(Expression(DummyEq(lock, 0)))
                     copies.append(self._map_update_host(f, i))
-                    resetlock.append(Expression(DummyEq(lock, 1)))
-
-            # Turn `parregion` into an ElementalFunction so that it can be
-            # executed asynchronously by `threadhost`
+                    resetlock.append(Expression(DummyEq(locks.makedefault(f, i), 1)))
             header = [c.Line(), c.Comment("Device can now write again to `%s`"
                                           % ",".join(f.name for f in rimaskss))]
             body = List(header=copies + header, body=resetlock, footer=c.Line())
-            efunc = make_efunc('copy_device_to_host%d' % n, List(body=[body, parregion]))
+            body = List(body=[body, parregion])
+
+            # Here we derive the ElementalFunction parameters, which may be either
+            # static or dynamic. The static ones are provided at thread creation time,
+            # while the dynamic ones through a shared struct
+            known_params = iet.parameters + (parregion.nthreads,) + tuple(locks.values())
+            static_params, dynamic_params = split(derive_parameters(body),
+                                                  lambda i: i in known_params)
+            shared_struct = DynamicParams('dp', n, dynamic_params)
+            static_params.append(shared_struct)
+
+            # Wrap the body within logic to enable asynchronous thread kick-off
+            # and termination
+            flag = FieldFromComposite('flag', shared_struct)
+            body = While(True, Conditional(CondEq(flag, 2), Return(),
+                                           Conditional(CondEq(flag, 0), Continue, body)))
+
+            # Finally we put everything together
+            efunc = ElementalFunction('copydata%d' % n, body, 'void', static_params)
+
+            # Thread instantiation
+            threads.append(efunc.make_call(retobj=thread))
 
             # Replace with a call to the `efunc` plus suitable locking logic
+            setlock = []
+            for f, imasks in rimaskss.items():
+                for i in imasks:
+                    setlock.append(Expression(DummyEq(locks.makedefault(f, i), 0)))
             ascall = List(
                 header=c.Comment("Wait for host thread to be available again"),
-                body=[threadwait] + [List(
+                body=[threadwait(thread)] + [List(
                     header=c.Line(),
                     body=setlock + [List(
-                        header=[c.Line(), c.Comment("Spawn thread to perform the copy")],
-                        body=efunc.make_call(retobj=threadhost)
+                        header=[c.Line(), c.Comment("Unlock idle thread")],
+                        body=Expression(DummyEq(FieldFromComposite('flag', dynparams), 1))
                     )]
                 )]
             )
+            from IPython import embed; embed()
 
             efuncs.append(efunc)
             mapper[parregion] = ascall
 
         iet = Transformer(mapper).visit(iet)
 
-        # Make sure we don't jump back to Python-land until the host thread is done
-        threadwait = List(header=[c.Line(),
-                                  c.Comment("Wait for completion of host thread")],
-                          body=threadwait)
-
         # Explicitly initialize the locks
         body = []
         for i in locks.values():
             values = np.ones(i.shape, dtype=np.int32).tolist()
             body.append(LocalExpression(DummyEq(i, ListInitializer(values))))
-        locks_init = List(body=body, footer=c.Line())
+        init = List(body=body, footer=c.Line())
 
-        iet = iet._rebuild(body=(locks_init,) + iet.body + (threadwait,))
+        # Make sure we don't jump back to Python-land until the host thread is done
+        wait = List(header=[c.Line(), c.Comment("Wait for completion of host threads")],
+                    body=[threadwait(i) for i in threads])
+
+        iet = iet._rebuild(body=(init,) + iet.body + (wait,))
 
         return iet, {'efuncs': efuncs, 'includes': ['thread']}
 
@@ -658,6 +682,37 @@ class STDThread(LocalObject):
 
     # Pickling support
     _pickle_args = ['name']
+
+
+class DynamicParams(LocalCompositeObject):
+
+    def __init__(self, prefix, key, params):
+        self._prefix = prefix
+        self._key = key
+        self._params = params
+
+        name = "%s%d" % (prefix, key)
+        pname = "dynparams%d" % key
+        fields = [(i.name, i._C_ctype) for i in params]
+
+        fields.append(('flag', c_int))
+
+        super(DynamicParams, self).__init__(name, pname, fields)
+
+    @property
+    def prefix(self):
+        return self._prefix
+
+    @property
+    def key(self):
+        return self._key
+
+    @property
+    def params(self):
+        return self._params
+
+    # Pickling support
+    _pickle_args = ['prefix', 'key', 'params']
 
 
 class Locks(dict):
