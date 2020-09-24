@@ -23,7 +23,7 @@ __all__ = ['Node', 'Block', 'Expression', 'Element', 'Callable', 'Call', 'Condit
            'Iteration', 'List', 'LocalExpression', 'Section', 'TimedList', 'Prodder',
            'MetaCall', 'PointerCast', 'ForeignExpression', 'HaloSpot', 'IterationTree',
            'ExpressionBundle', 'AugmentedExpression', 'Increment', 'Return', 'While',
-           'ParallelIteration', 'ParallelBlock', 'Dereference', 'Lambda']
+           'ParallelIteration', 'ParallelBlock', 'Dereference', 'Lambda', 'Continue']
 
 # First-class IET nodes
 
@@ -1000,6 +1000,7 @@ class ParallelBlock(Block):
     is_ParallelBlock = True
 
 
+Continue = Element(c.Statement('continue'))
 Return = lambda i='': Element(c.Statement('return%s' % ((' %s' % i) if i else i)))
 
 
