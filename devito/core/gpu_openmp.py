@@ -96,15 +96,11 @@ class DeviceOmpizer(Ompizer):
                                                       for i in cls._map_data(f)))
 
     @classmethod
-    def _map_update_host(cls, f, datamap):
+    def _map_update_host(cls, f, imask):
         datasize = cls._map_data(f)
-        assert len(datamap) == len(datasize)
-        ranges = []
-        for i, j in zip(datamap, datasize):
-            if i is FULL:
-                ranges.append('[0:%s]' % j)
-            else:
-                ranges.append('[%s]' % i)
+        assert len(imask) == len(datasize)
+        ranges = ['[%s:%s]' % ((0, j) if i is FULL else (i, ''.join(str(i+1).split())))
+                  for i, j in zip(imask, datasize)]
         return cls.lang['map-update-host'](f.name, ''.join(ranges))
 
     @classmethod
@@ -176,25 +172,24 @@ class DeviceOmpizer(Ompizer):
             ondevice = [i for i in indexeds if is_ondevice(i, self.device_fit)]
 
             # Get the Function's that, if written, will have to be copied to the host
-            rmetadata = self._make_datamaps(ondevice, partree)
+            rimaskss = build_imask_mapper(ondevice, partree)
 
-            rmapper[partree].update(rmetadata)
+            rmapper[partree].update(rimaskss)
 
             # Get the closest tree performing a write to any of the Function's read
             # in ``partree``.
             wnext = None
-            wmetadata = None
+            wimaskss = None
             for i in sorted(partrees, key=lambda i: partree is i, reverse=True):
                 if not isinstance(i.root, DeviceOpenMPIteration):
                     continue
 
                 indexeds = [e.output for e in FindNodes(Expression).visit(i)]
-                if not any(idx.function in set(rmetadata) for idx in indexeds):
+                if not any(idx.function in set(rimaskss) for idx in indexeds):
                     continue
 
                 # Found!
-                wmapper[i].update(self._make_datamaps(indexeds, i))
-
+                wmapper[i].update(build_imask_mapper(indexeds, i))
                 break
 
         efuncs = []
@@ -202,46 +197,61 @@ class DeviceOmpizer(Ompizer):
         locks = Locks(self.sregistry.make_name)
 
         # Protect `wnext` from race conditions
-        for wnext, wmetadata in wmapper.items():
+        for wnext, wimaskss in wmapper.items():
             conditions = []
-            for f, datamaps in wmetadata.items():
-                for i in datamaps:
+            for f, imasks in wimaskss.items():
+                for i in imasks:
                     conditions.append(CondEq(locks.makedefault(f, i), 0))
             condition = sympy.And(*conditions)
             body = List(header=c.Comment("Wait for `%s` to be copied to the host" %
-                                         ",".join(i.name for i in wmetadata)),
+                                         ",".join(f.name for f in wimaskss)),
                         body=While(condition),
                         footer=c.Line(""))
             mapper[wnext] = wnext._rebuild(prefix=(body,) + wnext.prefix)
 
         # The host partrees will be executed by another thread asynchronously
         threadhost = STDThread('thread')
-        theadwait = List(
-            header=[c.Line(""), c.Comment("Wait for completion of host thread")],
+        threadwait = List(
             body=Conditional(DefFunction(FieldFromComposite('joinable', threadhost.name)),
                              Call(FieldFromComposite('join', threadhost.name)))
         )
 
         # Protect `partree` from race conditions and add in pragmas for data copy
-        for n, (partree, rmetadata) in enumerate(rmapper.items()):
+        for n, (partree, rimaskss) in enumerate(rmapper.items()):
             copies = []
-            body = []
-            for f, datamaps in rmetadata.items():
-                for i in datamaps:
-                    body.append(Expression(DummyEq(locks.makedefault(f, i), 1)))
+            setlock = []
+            resetlock = []
+            for f, imasks in rimaskss.items():
+                for i in imasks:
+                    lock = locks.makedefault(f, i)
+                    setlock.append(Expression(DummyEq(lock, 0)))
                     copies.append(self._map_update_host(f, i))
-            header = [c.Line(""), c.Comment("Device can now write again to `%s`"
-                                            % ",".join(i.name for i in rmetadata))]
-            body = List(header=copies + header, body=body, footer=c.Line(""))
-            rebuilt = partree._rebuild(prefix=(body,) + partree.prefix)
+                    resetlock.append(Expression(DummyEq(lock, 1)))
 
-            # Turn it into an ElementalFunction
+            # Turn `partree` into an ElementalFunction so that it can be
+            # executed asynchronously by `threadhost`
+            header = [c.Line(""), c.Comment("Device can now write again to `%s`"
+                                            % ",".join(f.name for f in rimaskss))]
+            body = List(header=copies + header, body=resetlock, footer=c.Line(""))
+            rebuilt = partree._rebuild(prefix=(body,) + partree.prefix)
             efunc = make_efunc('copy_device_to_host%d' % n, rebuilt)
+
+            # Replace with a call to the `efunc` plus suitable locking logic
             call = efunc.make_call()
             #TODO: add `threadwait`
             #TODO: add devicemask[t1] = 0;
             #TODO: make it `thread = <call>`
 
+            ascall = List(
+                header=c.Comment("Wait for host thread to be available again"),
+                body=[threadwait] + [List(
+                    header=c.Line(""),
+                    body=setlock + [List(
+                        header=[c.Line(""), c.Comment("Spawn thread to perform the copy")],
+                        body=call
+                    )]
+                )]
+            )
             from IPython import embed; embed()
 
             efuncs.append(efunc)
@@ -250,33 +260,15 @@ class DeviceOmpizer(Ompizer):
         iet = Transformer(mapper).visit(iet)
 
         # Make sure we don't jump back to Python-land until the host thread is done
+        threadwait = List(header=[c.Line(""),
+                                  c.Comment("Wait for completion of host thread")],
+                          body=threadwait)
         iet = iet._rebuild(body=iet.body + (threadwait,))
 
         # Add all necessary local variable definitions
         args = [self.nthreads]  #TODO
 
         return iet, {'efuncs': [parfor], 'args': args, 'includes': ['thread']}
-
-    def _make_datamaps(self, indexeds, root):
-        """
-        Build a datamap for the Indexed's in a tree. A datamap is used to
-        distinguish parallel from sequential Dimensions.
-        """
-        #TODO: Rewrite docstring
-        #TODO: move to utils function?
-        mapper = defaultdict(set)
-        for indexed in indexeds:
-            f = indexed.function
-            if not f.is_DiscreteFunction:
-                continue
-
-            assert root.dim in f.dimensions
-            n = f.dimensions.index(root.dim)
-            datamap = indexed.indices[:n] + (FULL,)*len(indexed.indices[n:])
-
-            mapper[indexed.function].add(tuple(datamap))
-
-        return mapper
 
 
 class DeviceOpenMPDataManager(DataManager):
@@ -614,6 +606,42 @@ def is_ondevice(maybe_symbol, device_fit):
                for f in functions)
 
 
+def build_imask_mapper(indexeds, root):
+    """
+    An Indexed mask, or simply imask, is a representation of an Indexed such that,
+    given a Dimension `d` and the corresponding index `i`,
+
+        * if `d` is a device-offloaded Dimension, then the mask abstracts away
+          the index using the special object FULL
+        * if, instead, `d` is a sequential (or simply non-offloaded) Dimension, then
+          the mask will use `i`.
+
+    This function builds a mapper from Function's to imask's for all Indexed's
+    found in a given IET.
+
+    Examples
+    --------
+    Let's say the caller wants to build an imask mapper for a subset of the Indexed's
+    within `root`. For example, `root` is a perfect nest of Iteration's over the
+    Dimension's `[t, x, y, z]`, while `indexeds = [u[t1, x, y, z], u[t2, x, y, z],
+    v[t1, x, 0, z]]`. Then the imask mapper will be `{u(t, x, ,y, z): [(t1, FULL,
+    FULL, FULL), (t2, FULL, FULL, FULL)], v(t, x, y, z): [(t1, FULL, FULL, FULL)]}`.
+    """
+    imasks = defaultdict(set)
+    for indexed in indexeds:
+        f = indexed.function
+        if not f.is_DiscreteFunction:
+            continue
+
+        assert root.dim in f.dimensions
+        n = f.dimensions.index(root.dim)
+        imask = indexed.indices[:n] + (FULL,)*len(indexed.indices[n:])
+
+        imasks[indexed.function].add(tuple(imask))
+
+    return imasks
+
+
 class STDThread(LocalObject):
     dtype = type('std::thread', (c_void_p,), {}) 
 
@@ -635,9 +663,9 @@ class Locks(dict):
         self.make_name = make_name
         super().__init__(*args, **kwargs)
 
-    def makedefault(self, f, datamap):
+    def makedefault(self, f, imask):
         # The lock-protected Dimension's
-        locked = [i for i in datamap if i is not FULL]
+        locked = [i for i in imask if i is not FULL]
 
         if f not in self:
             name = self.make_name(prefix='%s_lock' % f.name)
