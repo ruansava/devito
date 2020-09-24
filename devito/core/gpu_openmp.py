@@ -12,9 +12,8 @@ from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import (Block, Call, Callable, Conditional, ElementalFunction, Expression,
-                           List, LocalExpression, Iteration, While, FindNodes,
-                           FindSymbols, MapExprStmts, Transformer, filter_iterations,
-                           make_efunc, retrieve_iteration_tree)
+                           List, LocalExpression, While, FindNodes, FindSymbols,
+                           MapExprStmts, Transformer, make_efunc)
 from devito.logger import warning
 from devito.mpi.distributed import MPICommObject
 from devito.mpi.routines import (CopyBuffer, HaloUpdate, IrecvCall, IsendCall, SendRecv,
@@ -22,11 +21,11 @@ from devito.mpi.routines import (CopyBuffer, HaloUpdate, IrecvCall, IsendCall, S
 from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_increments,
                                     factorize, fuse, optimize_pows)
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
-                               ParallelTree, optimize_halospots, mpiize, hoist_prodders,
-                               iet_pass)
-from devito.symbolics import Byref, CondEq, DefFunction, FieldFromComposite
-from devito.tools import as_tuple, filter_ordered, filter_sorted, split, timed_pass
-from devito.types import Array, CustomDimension, Dimension, LocalObject, Symbol
+                               ParallelTree, OpenMPRegion, optimize_halospots,
+                               mpiize, hoist_prodders, iet_pass)
+from devito.symbolics import CondEq, DefFunction, FieldFromComposite, ListInitializer
+from devito.tools import as_tuple, filter_sorted, timed_pass
+from devito.types import Array, CustomDimension, LocalObject
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
@@ -42,10 +41,6 @@ class DeviceOpenMPIteration(OpenMPIteration):
     def _make_clauses(cls, **kwargs):
         kwargs['chunk_size'] = False
         return super(DeviceOpenMPIteration, cls)._make_clauses(**kwargs)
-
-
-class HostParallelIteration(OpenMPIteration):
-    pass
 
 
 class DeviceOmpizer(Ompizer):
@@ -125,8 +120,11 @@ class DeviceOmpizer(Ompizer):
         raise NotImplementedError
 
     def _make_threaded_prodders(self, partree):
-        # no-op for now
-        return partree
+        if isinstance(partree.root, DeviceOpenMPIteration):
+            # no-op for now
+            return partree
+        else:
+            return super()._make_threaded_prodders(partree)
 
     def _make_partree(self, candidates, nthreads=None):
         """
@@ -155,39 +153,47 @@ class DeviceOmpizer(Ompizer):
             return super()._make_partree(candidates, nthreads)
 
     def _make_parregion(self, partree, *args):
-        # no-op for now
-        return partree
+        if isinstance(partree.root, DeviceOpenMPIteration):
+            # no-op for now
+            return partree
+        else:
+            return super()._make_parregion(partree, *args)
 
-    def _make_guard(self, partree, *args):
-        # no-op for now
-        return partree
+    def _make_guard(self, parregion, *args):
+        partrees = FindNodes(ParallelTree).visit(parregion)
+        if any(isinstance(i.root, DeviceOpenMPIteration) for i in partrees):
+            # no-op for now
+            return parregion
+        else:
+            return super()._make_guard(parregion, *args)
 
     def _make_nested_partree(self, partree):
-        # no-op for now
-        return partree
+        if isinstance(partree.root, DeviceOpenMPIteration):
+            # no-op for now
+            return partree
+        else:
+            return super()._make_nested_partree(partree)
 
     def _make_orchestration(self, iet):
         partrees = FindNodes(ParallelTree).visit(iet)
+        parregions = FindNodes(OpenMPRegion).visit(iet)
 
         wmapper = defaultdict(dict)
         rmapper = defaultdict(dict)
-        for partree in partrees:
-            if type(partree.root) != OpenMPIteration:
-                continue
+        for parregion in parregions:
+            assert type(parregion.root) is OpenMPIteration
 
-            indexeds = FindSymbols('indexeds').visit(partree)
+            indexeds = FindSymbols('indexeds').visit(parregion)
             ondevice = [i for i in indexeds if is_ondevice(i, self.device_fit)]
 
             # Get the Function's that, if written, will have to be copied to the host
-            rimaskss = build_imask_mapper(ondevice, partree)
+            rimaskss = build_imask_mapper(ondevice, parregion.root)
 
-            rmapper[partree].update(rimaskss)
+            rmapper[parregion].update(rimaskss)
 
             # Get the closest tree performing a write to any of the Function's read
-            # in ``partree``.
-            wnext = None
-            wimaskss = None
-            for i in sorted(partrees, key=lambda i: partree is i, reverse=True):
+            # in ``parregion``.
+            for i in sorted(partrees, key=lambda i: parregion.partree is i, reverse=True):
                 if not isinstance(i.root, DeviceOpenMPIteration):
                     continue
 
@@ -199,11 +205,10 @@ class DeviceOmpizer(Ompizer):
                 wmapper[i].update(build_imask_mapper(indexeds, i))
                 break
 
-        efuncs = []
-        mapper = {}
         locks = Locks(self.sregistry.make_name)
 
         # Protect `wnext` from race conditions
+        mapper = {}
         for wnext, wimaskss in wmapper.items():
             conditions = []
             for f, imasks in wimaskss.items():
@@ -213,18 +218,19 @@ class DeviceOmpizer(Ompizer):
             body = List(header=c.Comment("Wait for `%s` to be copied to the host" %
                                          ",".join(f.name for f in wimaskss)),
                         body=While(condition),
-                        footer=c.Line(""))
+                        footer=c.Line())
             mapper[wnext] = wnext._rebuild(prefix=(body,) + wnext.prefix)
 
-        # The host partrees will be executed by another thread asynchronously
+        # The `parregion` will be executed by another thread asynchronously
         threadhost = STDThread('thread')
         threadwait = List(
-            body=Conditional(DefFunction(FieldFromComposite('joinable', threadhost.name)),
-                             Call(FieldFromComposite('join', threadhost.name)))
+            body=Conditional(DefFunction(FieldFromComposite('joinable', threadhost)),
+                             Call(FieldFromComposite('join', threadhost)))
         )
 
-        # Protect `partree` from race conditions and add in pragmas for data copy
-        for n, (partree, rimaskss) in enumerate(rmapper.items()):
+        # Protect `parregion` from race conditions and add in pragmas for data copy
+        efuncs = []
+        for n, (parregion, rimaskss) in enumerate(rmapper.items()):
             copies = []
             setlock = []
             resetlock = []
@@ -235,47 +241,44 @@ class DeviceOmpizer(Ompizer):
                     copies.append(self._map_update_host(f, i))
                     resetlock.append(Expression(DummyEq(lock, 1)))
 
-            # Turn `partree` into an ElementalFunction so that it can be
+            # Turn `parregion` into an ElementalFunction so that it can be
             # executed asynchronously by `threadhost`
-            header = [c.Line(""), c.Comment("Device can now write again to `%s`"
-                                            % ",".join(f.name for f in rimaskss))]
-            body = List(header=copies + header, body=resetlock, footer=c.Line(""))
-            rebuilt = partree._rebuild(prefix=(body,) + partree.prefix)
-            efunc = make_efunc('copy_device_to_host%d' % n, rebuilt)
+            header = [c.Line(), c.Comment("Device can now write again to `%s`"
+                                          % ",".join(f.name for f in rimaskss))]
+            body = List(header=copies + header, body=resetlock, footer=c.Line())
+            efunc = make_efunc('copy_device_to_host%d' % n, List(body=[body, parregion]))
+            efuncs.append(efunc)
 
             # Replace with a call to the `efunc` plus suitable locking logic
-            call = efunc.make_call()
-            #TODO: add `threadwait`
-            #TODO: add devicemask[t1] = 0;
-            #TODO: make it `thread = <call>`
-
             ascall = List(
                 header=c.Comment("Wait for host thread to be available again"),
                 body=[threadwait] + [List(
-                    header=c.Line(""),
+                    header=c.Line(),
                     body=setlock + [List(
-                        header=[c.Line(""), c.Comment("Spawn thread to perform the copy")],
-                        body=call
+                        header=[c.Line(), c.Comment("Spawn thread to perform the copy")],
+                        body=efunc.make_call(retobj=threadhost)
                     )]
                 )]
             )
-            from IPython import embed; embed()
-
-            efuncs.append(efunc)
-            mapper[partree] = rebuilt
+            mapper[parregion] = ascall
 
         iet = Transformer(mapper).visit(iet)
 
         # Make sure we don't jump back to Python-land until the host thread is done
-        threadwait = List(header=[c.Line(""),
+        threadwait = List(header=[c.Line(),
                                   c.Comment("Wait for completion of host thread")],
                           body=threadwait)
-        iet = iet._rebuild(body=iet.body + (threadwait,))
 
-        # Add all necessary local variable definitions
-        args = [self.nthreads]  #TODO
+        # Explicitly initialize the locks
+        body = []
+        for i in locks.values():
+            values = np.ones(i.shape, dtype=np.int32).tolist()
+            body.append(LocalExpression(DummyEq(i, ListInitializer(values))))
+        locks_init = List(body=body, footer=c.Line())
 
-        return iet, {'efuncs': [parfor], 'args': args, 'includes': ['thread']}
+        iet = iet._rebuild(body=(locks_init,) + iet.body + (threadwait,))
+
+        return iet, {'efuncs': efuncs, 'includes': ['thread']}
 
 
 class DeviceOpenMPDataManager(DataManager):
@@ -737,7 +740,7 @@ def build_imask_mapper(indexeds, root):
 
 
 class STDThread(LocalObject):
-    dtype = type('std::thread', (c_void_p,), {}) 
+    dtype = type('std::thread', (c_void_p,), {})
 
     def __init__(self, name):
         self.name = name
@@ -772,7 +775,7 @@ class Locks(dict):
                 else:
                     dims.append(d)
 
-            #TODO: MAKE IT volatile int !!!
-            self[f] = Array(name=name, dimensions=dims, dtype=np.int32)
+            self[f] = Array(name=name, dimensions=dims, dtype=np.int32, scope='stack',
+                            volatile=True)
 
         return self[f][locked]
