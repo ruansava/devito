@@ -19,7 +19,8 @@ from devito.types.caching import Cached
 from devito.types.lazy import Evaluable
 from devito.types.utils import DimensionTuple
 
-__all__ = ['Symbol', 'Scalar', 'Indexed', 'Object', 'LocalObject', 'CompositeObject']
+__all__ = ['Symbol', 'Scalar', 'Indexed', 'Object', 'LocalObject', 'CompositeObject',
+           'LocalCompositeObject']
 
 
 Size = namedtuple('Size', 'left right')
@@ -1132,6 +1133,30 @@ class LocalObject(AbstractObject):
     """
 
     is_LocalObject = True
+
+
+class LocalCompositeObject(CompositeObject, LocalObject):
+
+    """
+    Symbol representing a pointer to a composite type (e.g., a C struct),
+    defined in the local scope.
+    """
+
+    def __init__(self, name, pname, pfields):
+        super().__init__(name, pname, pfields)
+
+    def __value_setup__(self, *args):
+        return None
+
+    @property
+    def _arg_names(self):
+        return ()
+
+    def _arg_defaults(self):
+        return {}
+
+    def _arg_values(self, **kwargs):
+        return {}
 
 
 # Extended SymPy hierarchy follows, for essentially two reasons:
