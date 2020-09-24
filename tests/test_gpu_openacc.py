@@ -6,7 +6,8 @@ from devito import (Grid, Constant, Function, TimeFunction, Eq, Operator,
                     ConditionalDimension, norm, solve)
 from devito.data import LEFT
 from devito.ir.iet import FindNodes, retrieve_iteration_tree
-from devito.core.gpu_openmp import HostParallelIteration
+from devito.passes.iet import OpenMPIteration
+from devito.core.gpu_openmp import DeviceOpenMPIteration
 from examples.seismic import TimeAxis, RickerSource, Receiver
 
 
@@ -50,7 +51,7 @@ class TestCodeGeneration(object):
 
         eqns = [Eq(u.forward, u + 1), Eq(usave, u.forward)]
 
-        # Make sure `u[t1]` is copied back to the host, and HostParallelIteration
+        # Make sure `u[t1]` is copied back to the host
         op = Operator(eqns, platform='nvidiaX', language='openacc')
         from IPython import embed; embed()
         assert len(op.body[1].header) == 2
@@ -61,7 +62,8 @@ class TestCodeGeneration(object):
         assert 'copyin(usave' not in str(op)
         trees = retrieve_iteration_tree(op)
         assert len(trees) == 2
-        hpis = FindNodes(HostParallelIteration).visit(op)
+        hpis = FindNodes(OpenMPIteration).visit(op)
+        #TODO: Filter out DeviceOpenMPIteration
         assert len(hpis) == 1
         hpi = hpis[0]
         assert len(hpi.header) == 1
@@ -80,7 +82,8 @@ class TestCodeGeneration(object):
             ('acc enter data copyin(usave[0:usave_vec->size[0]]'
              '[0:usave_vec->size[1]][0:usave_vec->size[2]][0:usave_vec->size[3]])')
         assert str(op.body[1].header[2]) == ''
-        hpis = FindNodes(HostParallelIteration).visit(op)
+        hpis = FindNodes(OpenMPIteration).visit(op)
+        #TODO: Filter out DeviceOpenMPIteration
         assert len(hpis) == 0
 
 

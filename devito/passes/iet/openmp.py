@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 
 import numpy as np
@@ -16,7 +17,7 @@ from devito.tools import as_tuple, is_integer, prod
 from devito.types import Constant, PointerArray, Symbol
 
 __all__ = ['NThreads', 'NThreadsNested', 'NThreadsNonaffine', 'Ompizer',
-           'OpenMPIteration', 'ParallelTree']
+           'OpenMPIteration', 'ParallelTree', 'OpenMPRegion']
 
 
 def ncores():
@@ -75,10 +76,26 @@ class NThreadsNonaffine(NThreads):
 
 class OpenMPRegion(ParallelBlock):
 
-    def __init__(self, body, nthreads, private=None):
-        header = OpenMPRegion._make_header(nthreads, private)
-        super(OpenMPRegion, self).__init__(header=header, body=body)
-        self.nthreads = nthreads
+    def __init__(self, body, private=None):
+        # Normalize and sanity-check input
+        body = as_tuple(body)
+        assert len(body) == 1 and isinstance(body[0], ParallelTree)
+        partree = body[0]
+
+        header = OpenMPRegion._make_header(partree.nthreads, private)
+        super(OpenMPRegion, self).__init__(header=header, body=partree)
+
+    @property
+    def partree(self):
+        return self.body[0]
+
+    @property
+    def root(self):
+        return self.partree.root
+
+    @property
+    def nthreads(self):
+        return self.partree.nthreads
 
     @classmethod
     def _make_header(cls, nthreads, private=None):
@@ -422,22 +439,22 @@ class Ompizer(object):
                                                         array=i))
             heap_globals.append(Dereference(i, pi))
         if heap_globals:
-            body = List(header=self._make_tid(self.threadid),
-                        body=heap_globals+[partree], footer=c.Line())
-        else:
-            body = partree
+            prefix = List(header=self._make_tid(self.threadid),
+                          body=heap_globals + list(partree.prefix),
+                          footer=c.Line())
+            partree = partree._rebuild(prefix=prefix)
 
-        return OpenMPRegion(body, partree.nthreads)
+        return self._Region(partree)
 
-    def _make_guard(self, partree, collapsed):
+    def _make_guard(self, parregion, collapsed):
         # Do not enter the parallel region if the step increment is 0; this
         # would raise a `Floating point exception (core dumped)` in some OpenMP
         # implementations. Note that using an OpenMP `if` clause won't work
         cond = [CondEq(i.step, 0) for i in collapsed if isinstance(i.step, Symbol)]
         cond = Or(*cond)
         if cond != False:  # noqa: `cond` may be a sympy.False which would be == False
-            partree = List(body=[Conditional(cond, Return()), partree])
-        return partree
+            parregion = List(body=[Conditional(cond, Return()), parregion])
+        return parregion
 
     def _make_nested_partree(self, partree):
         # Apply heuristic
