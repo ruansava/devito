@@ -99,9 +99,9 @@ class CodePrinter(C99CodePrinter):
     def _print_Differentiable(self, expr):
         return "(" + self._print(expr._expr) + ")"
 
-    def _print_FunctionFromPointer(self, expr):
+    def _print_RoutineFromPointer(self, expr):
         indices = [self._print(i) for i in expr.params]
-        return "%s->%s(%s)" % (expr.pointer, expr.function, ', '.join(indices))
+        return "%s->%s(%s)" % (expr.pointer, expr.routine, ', '.join(indices))
 
     def _print_FieldFromPointer(self, expr):
         return "%s->%s" % (expr.pointer, expr.field)

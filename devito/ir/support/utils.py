@@ -133,7 +133,7 @@ def detect_io(exprs, relax=False):
             roots.extend(list(i.lhs.indices))
             roots.extend(list(i.conditionals.values()))
         except AttributeError:
-            # E.g., FunctionFromPointer
+            # E.g., RoutineFromPointer
             roots.append(i)
 
     reads = []

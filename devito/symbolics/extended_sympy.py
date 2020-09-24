@@ -9,7 +9,7 @@ from sympy import Expr, Integer, Function, Symbol
 from devito.symbolics.printer import ccode
 from devito.tools import Pickable, as_tuple, is_integer
 
-__all__ = ['CondEq', 'CondNe', 'IntDiv', 'FunctionFromPointer', 'FieldFromPointer',
+__all__ = ['CondEq', 'CondNe', 'IntDiv', 'RoutineFromPointer', 'FieldFromPointer',
            'FieldFromComposite', 'ListInitializer', 'Byref', 'IndexedPointer',
            'DefFunction', 'InlineIf', 'Macro', 'Literal', 'INT', 'FLOAT', 'DOUBLE',
            'FLOOR', 'cast_mapper']
@@ -91,21 +91,21 @@ class IntDiv(sympy.Expr):
     __repr__ = __str__
 
 
-class FunctionFromPointer(sympy.Expr, Pickable):
+class RoutineFromPointer(sympy.Expr, Pickable):
 
     """
-    Symbolic representation of the C notation ``pointer->function(params)``.
+    Symbolic representation of the C notation ``pointer->routine(params)``.
     """
 
-    def __new__(cls, function, pointer, params=None):
+    def __new__(cls, routine, pointer, params=None):
         args = []
         if isinstance(pointer, str):
             pointer = Symbol(pointer)
         args.append(pointer)
-        if isinstance(function, (DefFunction, FunctionFromPointer)):
-            args.append(function)
-        elif not isinstance(function, str):
-            raise ValueError("`function` must be FunctionFromPointer or str")
+        if isinstance(routine, (DefFunction, RoutineFromPointer)):
+            args.append(routine)
+        elif not isinstance(routine, str):
+            raise ValueError("`routine` must be RoutineFromPointer or str")
         _params = []
         for p in as_tuple(params):
             if isinstance(p, str):
@@ -116,50 +116,50 @@ class FunctionFromPointer(sympy.Expr, Pickable):
                 _params.append(p)
         args.extend(_params)
         obj = sympy.Expr.__new__(cls, *args)
-        obj.function = function
+        obj.routine = routine
         obj.pointer = pointer
         obj.params = tuple(_params)
         return obj
 
     def __str__(self):
-        return '%s->%s(%s)' % (self.pointer, self.function,
+        return '%s->%s(%s)' % (self.pointer, self.routine,
                                ", ".join(str(i) for i in as_tuple(self.params)))
 
     __repr__ = __str__
 
     def _hashable_content(self):
-        return super(FunctionFromPointer, self)._hashable_content() +\
-            (self.function, self.pointer) + self.params
+        return super(RoutineFromPointer, self)._hashable_content() +\
+            (self.routine, self.pointer) + self.params
 
     @property
     def base(self):
-        if isinstance(self.pointer, FunctionFromPointer):
-            # FunctionFromPointer may be nested
+        if isinstance(self.pointer, RoutineFromPointer):
+            # RoutineFromPointer may be nested
             return self.pointer.base
         else:
             return self.pointer
 
     # Pickling support
-    _pickle_args = ['function', 'pointer']
+    _pickle_args = ['routine', 'pointer']
     _pickle_kwargs = ['params']
     __reduce_ex__ = Pickable.__reduce_ex__
 
 
-class FieldFromPointer(FunctionFromPointer, Pickable):
+class FieldFromPointer(RoutineFromPointer, Pickable):
 
     """
     Symbolic representation of the C notation ``pointer->field``.
     """
 
     def __new__(cls, field, pointer):
-        return FunctionFromPointer.__new__(cls, field, pointer)
+        return RoutineFromPointer.__new__(cls, field, pointer)
 
     def __str__(self):
         return '%s->%s' % (self.pointer, self.field)
 
     @property
     def field(self):
-        return self.function
+        return self.routine
 
     # Our __new__ cannot accept the params argument
     _pickle_kwargs = []
@@ -167,7 +167,7 @@ class FieldFromPointer(FunctionFromPointer, Pickable):
     __repr__ = __str__
 
 
-class FieldFromComposite(FunctionFromPointer, Pickable):
+class FieldFromComposite(RoutineFromPointer, Pickable):
 
     """
     Symbolic representation of the C notation ``composite.field``,
@@ -175,14 +175,14 @@ class FieldFromComposite(FunctionFromPointer, Pickable):
     """
 
     def __new__(cls, field, composite):
-        return FunctionFromPointer.__new__(cls, field, composite)
+        return RoutineFromPointer.__new__(cls, field, composite)
 
     def __str__(self):
         return '%s.%s' % (self.composite, self.field)
 
     @property
     def field(self):
-        return self.function
+        return self.routine
 
     @property
     def composite(self):

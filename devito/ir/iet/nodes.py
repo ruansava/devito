@@ -13,7 +13,7 @@ from devito.data import FULL
 from devito.ir.equations import ClusterizedEq
 from devito.ir.support import (SEQUENTIAL, PARALLEL, PARALLEL_IF_ATOMIC, VECTORIZED,
                                AFFINE, Property, Forward, detect_io)
-from devito.symbolics import ListInitializer, FunctionFromPointer, as_symbol, ccode
+from devito.symbolics import ListInitializer, RoutineFromPointer, as_symbol, ccode
 from devito.tools import (Signer, as_tuple, filter_ordered, filter_sorted, flatten,
                           validate_type, dtype_to_cstr)
 from devito.types import Symbol, Indexed
@@ -820,11 +820,11 @@ class LocalExpression(Expression):
 
 class ForeignExpression(Expression):
 
-    """A node representing a SymPy FunctionFromPointer expression."""
+    """A node representing a SymPy RoutineFromPointer expression."""
 
     is_ForeignExpression = True
 
-    @validate_type(('expr', FunctionFromPointer),
+    @validate_type(('expr', RoutineFromPointer),
                    ('dtype', type))
     def __init__(self, expr, dtype, **kwargs):
         self._dtype = dtype
