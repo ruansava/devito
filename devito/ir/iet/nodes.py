@@ -40,6 +40,7 @@ class Node(Signer):
     is_Expression = False
     is_Increment = False
     is_ForeignExpression = False
+    is_LocalExpression = False
     is_Callable = False
     is_Lambda = False
     is_ElementalFunction = False
@@ -809,6 +810,8 @@ class LocalExpression(Expression):
     """
     A node encapsulating a SymPy equation which also defines its LHS.
     """
+
+    is_LocalExpression = True
 
     @property
     def defines(self):
