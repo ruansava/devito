@@ -240,20 +240,27 @@ class Call(ExprStmt, Node):
         The called function.
     arguments : list of Basic, optional
         The objects in input to the function call.
+    retobj : Symbol or Indexed, optional
+        The object the return value of the Call is assigned to.
     """
 
     is_Call = True
 
-    def __init__(self, name, arguments=None):
+    def __init__(self, name, arguments=None, retobj=None):
         self.name = str(name)
         self.arguments = as_tuple(arguments)
+        self.retobj = retobj
 
     def __repr__(self):
-        return "Call::\n\t%s(...)" % self.name
+        ret = "" if self.retobj is None else "%s = " % self.retobj
+        return "%sCall::\n\t%s(...)" % (ret, self.name)
 
     @property
     def functions(self):
-        return tuple(i for i in self.arguments if isinstance(i, AbstractFunction))
+        retval = tuple(i for i in self.arguments if isinstance(i, AbstractFunction))
+        if self.retobj is not None:
+            retval += (self.retobj.function,)
+        return retval
 
     @property
     def children(self):
@@ -269,11 +276,16 @@ class Call(ExprStmt, Node):
                 free.add(i)
             else:
                 free.update(i.free_symbols)
+        if self.retobj is not None:
+            free.update(self.retobj.free_symbols)
         return free
 
     @property
     def defines(self):
-        return ()
+        if self.retobj is not None:
+            return (self.retobj,)
+        else:
+            return ()
 
 
 class Expression(ExprStmt, Node):
