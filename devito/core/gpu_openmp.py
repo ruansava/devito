@@ -250,17 +250,17 @@ class DeviceOmpizer(Ompizer):
             known_params = iet.parameters + (parregion.nthreads,) + tuple(locks.values())
             static_params, dynamic_params = split(derive_parameters(body),
                                                   lambda i: i in known_params)
-            shared_struct = DynamicParams('dp', n, dynamic_params)
-            static_params.append(shared_struct)
+            dynparams = DynamicParams('dp', n, dynamic_params)
 
             # Wrap the body within logic to enable asynchronous thread kick-off
             # and termination
-            flag = FieldFromComposite('flag', shared_struct)
+            flag = FieldFromComposite('flag', dynparams)
             body = While(True, Conditional(CondEq(flag, 2), Return(),
                                            Conditional(CondEq(flag, 0), Continue, body)))
 
             # Finally we put everything together
-            efunc = ElementalFunction('copydata%d' % n, body, 'void', static_params)
+            efunc = ElementalFunction('copydata%d' % n, body, 'void',
+                                      static_params + [dynparams])
 
             # Thread instantiation
             threads.append(efunc.make_call(retobj=thread))
