@@ -139,6 +139,10 @@ class RoutineFromPointer(sympy.Expr, Pickable):
         else:
             return self.pointer
 
+    @property
+    def function(self):
+        return self.base.function
+
     # Pickling support
     _pickle_args = ['routine', 'pointer']
     _pickle_kwargs = ['params']
