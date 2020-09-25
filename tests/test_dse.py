@@ -687,8 +687,8 @@ class TestAliases(object):
         arrays = [i for i in FindSymbols().visit(op1._func_table['bf0'].root)
                   if i.is_Array and i._mem_local]
         assert len(arrays) == 2
-        self.check_array(arrays[0], ((1, 1), (0, 0)), (ys+2, zs), rotate)
-        self.check_array(arrays[1], ((1, 0), (1, 0), (0, 0)), (xs+1, ys+1, zs), rotate)
+        self.check_array(arrays[0], ((1, 0), (1, 0), (0, 0)), (xs+1, ys+1, zs), rotate)
+        self.check_array(arrays[1], ((1, 1), (0, 0)), (ys+2, zs), rotate)
 
         # Check numerical output
         op0(time_M=1)
@@ -725,8 +725,8 @@ class TestAliases(object):
         assert len(arrays) == 2
         assert len([i for i in arrays if i._mem_shared]) == 1
         assert len([i for i in arrays if i._mem_local]) == 1
-        self.check_array(arrays[1], ((1, 0), (0, 0), (0, 0)), (xs+1, ys, zs))
-        self.check_array(arrays[0], ((1, 0), (0, 0)), (ys+1, zs))
+        self.check_array(arrays[0], ((1, 0), (0, 0), (0, 0)), (xs+1, ys, zs))
+        self.check_array(arrays[1], ((1, 0), (0, 0)), (ys+1, zs))
 
         # Check that `advanced-fsg` + `min-storage` is incompatible
         try:
@@ -790,8 +790,8 @@ class TestAliases(object):
         arrays = [i for i in FindSymbols().visit(op1._func_table['bf0'].root)
                   if i.is_Array and i._mem_local]
         assert len(arrays) == 2
-        self.check_array(arrays[0], ((1, 1), (1, 0)), (ys+2, zs+1), rotate)
-        self.check_array(arrays[1], ((1, 0), (1, 0), (0, 0)), (xs+1, ys+1, zs), rotate)
+        self.check_array(arrays[0], ((1, 0), (1, 0), (0, 0)), (xs+1, ys+1, zs), rotate)
+        self.check_array(arrays[1], ((1, 1), (1, 0)), (ys+2, zs+1), rotate)
 
         # Check numerical output
         op0(time_M=1)
@@ -1517,14 +1517,13 @@ class TestAliases(object):
         # Check code generation
         pbs = FindNodes(ParallelBlock).visit(op1._func_table['bf0'].root)
         assert len(pbs) == 1
-        pb = pbs[0]
+        header = pbs[0].partree.prefix[0].header
         if rotate:
-            assert 'r6[2][y0_blk0_size][z_size]' in str(pb.body[0].header[0])
-            assert 'r3[2][z_size]' in str(pb.body[0].header[1])
+            assert 'r6[2][y0_blk0_size][z_size]' in str(header[0])
+            assert 'r3[2][z_size]' in str(header[1])
         else:
-            assert 'r6[x0_blk0_size + 1][y0_blk0_size][z_size]'\
-                in str(pb.body[0].header[0])
-            assert 'r3[y0_blk0_size + 1][z_size]' in str(pb.body[0].header[1])
+            assert 'r6[x0_blk0_size + 1][y0_blk0_size][z_size]' in str(header[0])
+            assert 'r3[y0_blk0_size + 1][z_size]' in str(header[1])
 
         # Check numerical output
         op0.apply(time_M=2)
