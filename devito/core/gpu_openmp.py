@@ -256,7 +256,7 @@ class DeviceOmpizer(Ompizer):
                     header=c.Line(),
                     body=setlock + [List(
                         header=[c.Line(), c.Comment("Spawn thread to perform the copy")],
-                        body=efunc.make_call(retobj=threadhost)
+                        body=Call('std::thread', efunc.make_call(), retobj=threadhost)
                     )]
                 )]
             )
