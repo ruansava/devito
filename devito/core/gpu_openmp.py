@@ -94,7 +94,7 @@ class DeviceOmpizer(Ompizer):
     def _map_update_host(cls, f, imask):
         datasize = cls._map_data(f)
         assert len(imask) == len(datasize)
-        ranges = ['[%s:%s]' % ((0, j) if i is FULL else (i, ''.join(str(i+1).split())))
+        ranges = ['[%s:%s]' % ((0, j) if i is FULL else (i, 1))
                   for i, j in zip(imask, datasize)]
         return cls.lang['map-update-host'](f.name, ''.join(ranges))
 
@@ -249,7 +249,8 @@ class DeviceOmpizer(Ompizer):
                     header=c.Line(),
                     body=setlock + [List(
                         header=[c.Line(), c.Comment("Spawn thread to perform the copy")],
-                        body=Call('std::thread', efunc.make_call(), retobj=threadhost)
+                        body=Call('std::thread', efunc.make_call(is_indirect=True),
+                                  retobj=threadhost,)
                     )]
                 )]
             )
