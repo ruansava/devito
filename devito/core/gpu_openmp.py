@@ -731,8 +731,9 @@ def build_imask_mapper(indexeds, root):
         if not f.is_DiscreteFunction:
             continue
 
-        assert root.dim in f.dimensions
-        n = f.dimensions.index(root.dim)
+        dim = root.dim.root
+        assert dim in f.dimensions
+        n = f.dimensions.index(dim)
         imask = indexed.indices[:n] + (FULL,)*len(indexed.indices[n:])
 
         imasks[indexed.function].add(tuple(imask))
@@ -776,7 +777,11 @@ class Locks(dict):
                 else:
                     dims.append(d)
 
-            self[f] = Array(name=name, dimensions=dims, dtype=np.int32, scope='stack',
-                            volatile=True)
+            self[f] = Array(
+                name=name, dimensions=dims, dtype=np.int32,
+                scope='stack',  # Always small, so don't bother using the heap
+                volatile=True,  # Classic multi-threading volatilization,
+                padding=0,  # Bypass `autopadding` which is useless here
+            )
 
         return self[f][locked]
