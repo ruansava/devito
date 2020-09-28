@@ -36,7 +36,8 @@ class TestCodeGeneration(object):
             ('acc exit data delete(u[0:u_vec->size[0]]'
              '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])')
 
-    def test_save(self):
+    @pytest.mark.parametrize('subdomain', ['domain', 'interior'])
+    def test_save_w_movement(self, subdomain):
         nt = 10
 
         grid = Grid(shape=(10, 10, 10))
@@ -49,31 +50,64 @@ class TestCodeGeneration(object):
         usave = TimeFunction(name='usave', grid=grid, time_order=0,
                              save=int(nt//factor.data), time_dim=time_sub)
 
-        eqns = [Eq(u.forward, u + 1), Eq(usave, u.forward)]
+        eqns = [Eq(u.forward, u + 1, subdomain=grid.subdomains[subdomain]),
+                Eq(usave, u.forward, subdomain=grid.subdomains[subdomain])]
 
-        # Make sure `u[t1]` is copied back to the host
         op = Operator(eqns, platform='nvidiaX', language='openacc')
-        from IPython import embed; embed()
-        assert len(op.body[1].header) == 2
-        assert op.body[1].header[0].value ==\
+
+        # Check out initialization
+        assert len(op.body[1].header) == 4
+        assert str(op.body[1].header[0]) == 'std::thread thread;'
+        assert str(op.body[1].header[1]) == ''
+        assert op.body[1].header[2].value ==\
             ('acc enter data copyin(u[0:u_vec->size[0]]'
              '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])')
-        assert str(op.body[1].header[1]) == ''
+        assert str(op.body[1].header[3]) == ''
         assert 'copyin(usave' not in str(op)
         trees = retrieve_iteration_tree(op)
         assert len(trees) == 2
-        hpis = FindNodes(OpenMPIteration).visit(op)
-        #TODO: Filter out DeviceOpenMPIteration
-        assert len(hpis) == 1
-        hpi = hpis[0]
-        assert len(hpi.header) == 1
-        assert 'acc update self(u[t' in hpi.header[0].value
-        assert '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])'\
-            in hpi.header[0].value
+
+        # Check out the wavefield saving on the host
+        efunc = op._func_table['copy_device_to_host0'].root
+        iters = FindNodes(OpenMPIteration).visit(efunc)
+        assert len(iters) == 1
+        iteration = iters[0]
+        assert type(iteration) == OpenMPIteration
+        assert iteration.pragmas[0].value == 'omp for collapse(3) schedule(static,1)'
+        top = efunc.body[1].body[0]
+        tdim = efunc.parameters[5].name
+        assert top.header[0].value == ('acc update self(u[%s:1][0:u_vec->size[1]]'
+                                       '[0:u_vec->size[2]][0:u_vec->size[3]])' % tdim)
+        assert str(top.body[0]) == 'u_lock0[%s] = 1;' % tdim
+
+        # Check out the computation on the device
+        iters = FindNodes(DeviceOpenMPIteration).visit(op)
+        assert len(iters) == 1
+        iteration = iters[0]
+        assert iteration.pragmas[0].value == 'acc parallel loop collapse(3)'
+
+    def test_save_no_movement(self):
+        nt = 10
+
+        grid = Grid(shape=(10, 10, 10))
+        time_dim = grid.time_dim
+
+        factor = Constant(name='factor', value=2, dtype=np.int32)
+        time_sub = ConditionalDimension(name="time_sub", parent=time_dim, factor=factor)
+
+        u = TimeFunction(name='u', grid=grid)
+        usave = TimeFunction(name='usave', grid=grid, time_order=0,
+                             save=int(nt//factor.data), time_dim=time_sub)
+
+        eqns = [Eq(u.forward, u + 1),
+                Eq(usave, u.forward)]
 
         # Now telling the compiler to keep `usave` on the GPU until the very end
         op = Operator(eqns, opt=('advanced', {'device-fit': usave}),
                       platform='nvidiaX', language='openacc')
+
+        # Unlike `test_save_w_movement`, now both usave and u are copied in to the
+        # device and then copied back to the host right before jumping off to Python
         assert len(op.body[1].header) == 3
         assert op.body[1].header[0].value ==\
             ('acc enter data copyin(u[0:u_vec->size[0]]'
@@ -82,9 +116,27 @@ class TestCodeGeneration(object):
             ('acc enter data copyin(usave[0:usave_vec->size[0]]'
              '[0:usave_vec->size[1]][0:usave_vec->size[2]][0:usave_vec->size[3]])')
         assert str(op.body[1].header[2]) == ''
-        hpis = FindNodes(OpenMPIteration).visit(op)
-        #TODO: Filter out DeviceOpenMPIteration
-        assert len(hpis) == 0
+
+        # Expect no parallel loops on the host
+        assert 'thread' not in str(op)
+        assert len(op._func_table) == 0
+        iters0 = FindNodes(DeviceOpenMPIteration).visit(op)
+        iters1 = FindNodes(OpenMPIteration).visit(op)
+        assert iters0 == iters1
+
+        assert len(op.body[1].footer) == 3
+        assert op.body[1].footer[1].contents[0].value ==\
+            ('acc exit data copyout(u[0:u_vec->size[0]]'
+             '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])')
+        assert op.body[1].footer[1].contents[1].value ==\
+            ('acc exit data delete(u[0:u_vec->size[0]]'
+             '[0:u_vec->size[1]][0:u_vec->size[2]][0:u_vec->size[3]])')
+        assert op.body[1].footer[2].contents[0].value ==\
+            ('acc exit data copyout(usave[0:usave_vec->size[0]]'
+             '[0:usave_vec->size[1]][0:usave_vec->size[2]][0:usave_vec->size[3]])')
+        assert op.body[1].footer[2].contents[1].value ==\
+            ('acc exit data delete(usave[0:usave_vec->size[0]]'
+             '[0:usave_vec->size[1]][0:usave_vec->size[2]][0:usave_vec->size[3]])')
 
 
 class TestOperator(object):
@@ -106,10 +158,11 @@ class TestOperator(object):
         assert np.all(np.array(u.data[0, :, :, :]) == time_steps)
 
     @skipif('nodevice')
-    def test_save(self):
+    @pytest.mark.parametrize('device_fit', [True, False])
+    def test_save(self, device_fit):
         nt = 10
+        grid = Grid(shape=(300, 300, 300))
 
-        grid = Grid(shape=(10, 10, 10))
         time_dim = grid.time_dim
 
         factor = Constant(name='factor', value=2, dtype=np.int32)
@@ -118,9 +171,11 @@ class TestOperator(object):
         u = TimeFunction(name='u', grid=grid)
         usave = TimeFunction(name='usave', grid=grid, time_order=0,
                              save=int(nt//factor.data), time_dim=time_sub)
+        # For the given `nt` and grid shape, `usave` is roughly 4*5*300**3=~ .5GB of data
 
         op = Operator([Eq(u.forward, u + 1), Eq(usave, u.forward)],
-                      platform='nvidiaX', language='openacc')
+                      platform='nvidiaX', language='openacc',
+                      opt=('advanced', {'device-fit': usave if device_fit else None}))
 
         op.apply(time_M=nt-1)
 
