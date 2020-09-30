@@ -198,6 +198,11 @@ class DeviceOmpizer(Ompizer):
                 wmapper[i].update(build_imask_mapper(indexeds, i))
                 break
 
+        if not wmapper:
+            # No host Function's (maybe due to using the option `device-fit`?),
+            # so we gently return with no changes to the IET
+            return iet, {}
+
         locks = Locks(self.sregistry.make_name)
 
         # Protect `wnext` from race conditions
