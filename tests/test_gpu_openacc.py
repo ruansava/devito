@@ -103,7 +103,7 @@ class TestCodeGeneration(object):
                 Eq(usave, u.forward)]
 
         # Now telling the compiler to keep `usave` on the GPU until the very end
-        op = Operator(eqns, opt=('advanced', {'device-fit': usave}),
+        op = Operator(eqns, opt=('advanced', {'gpu-fit': usave}),
                       platform='nvidiaX', language='openacc')
 
         # Unlike `test_save_w_movement`, now both usave and u are copied in to the
@@ -158,8 +158,8 @@ class TestOperator(object):
         assert np.all(np.array(u.data[0, :, :, :]) == time_steps)
 
     @skipif('nodevice')
-    @pytest.mark.parametrize('device_fit', [True, False])
-    def test_save(self, device_fit):
+    @pytest.mark.parametrize('gpu_fit', [True, False])
+    def test_save(self, gpu_fit):
         nt = 10
         grid = Grid(shape=(300, 300, 300))
 
@@ -175,7 +175,7 @@ class TestOperator(object):
 
         op = Operator([Eq(u.forward, u + 1), Eq(usave, u.forward)],
                       platform='nvidiaX', language='openacc',
-                      opt=('advanced', {'device-fit': usave if device_fit else None}))
+                      opt=('advanced', {'gpu-fit': usave if gpu_fit else None}))
 
         op.apply(time_M=nt-1)
 

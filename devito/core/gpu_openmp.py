@@ -68,7 +68,7 @@ class DeviceOmpizer(Ompizer):
 
     def __init__(self, sregistry, options, key=None):
         super().__init__(sregistry, options, key=key)
-        self.device_fit = options['device-fit']
+        self.gpu_fit = options['gpu-fit']
 
     @classmethod
     def _map_data(cls, f):
@@ -135,7 +135,7 @@ class DeviceOmpizer(Ompizer):
         assert candidates
         root = candidates[0]
 
-        if is_ondevice(root, self.device_fit):
+        if is_on_gpu(root, self.gpu_fit):
             # The typical case: all accessed Function's are device Function's, that is
             # all Function's are in the device memory. Then we offload the candidate
             # Iterations to the device
@@ -186,7 +186,7 @@ class DeviceOmpizer(Ompizer):
             assert type(parregion.root) is OpenMPIteration
 
             indexeds = FindSymbols('indexeds').visit(parregion)
-            ondevice = [i for i in indexeds if is_ondevice(i, self.device_fit)]
+            ondevice = [i for i in indexeds if is_on_gpu(i, self.gpu_fit)]
 
             # Get the Function's that, if written, will have to be copied to the host
             rimaskss = build_imask_mapper(ondevice, parregion.root)
@@ -208,7 +208,7 @@ class DeviceOmpizer(Ompizer):
                 break
 
         if not wmapper:
-            # No host Function's (maybe due to using the option `device-fit`?),
+            # No host Function's (maybe due to using the option `gpu-fit`?),
             # so we gently return with no changes to the IET
             return iet, {}
 
@@ -303,13 +303,13 @@ class DeviceOpenMPDataManager(DataManager):
             Dimension, used by the DataManager for parallel memory allocation).
         options : dict
             The optimization options.
-            Accepted: ['device-fit'].
-            * 'device-fit': an iterable of `Function`s that are guaranteed to fit
+            Accepted: ['gpu-fit'].
+            * 'gpu-fit': an iterable of `Function`s that are guaranteed to fit
               in the device memory. By default, all `Function`s except saved
               `TimeFunction`'s are assumed to fit in the device memory.
         """
         super().__init__(sregistry)
-        self.device_fit = options['device-fit']
+        self.gpu_fit = options['gpu-fit']
 
     def _alloc_array_on_high_bw_mem(self, site, obj, storage):
         _storage = Storage()
@@ -359,10 +359,10 @@ class DeviceOpenMPDataManager(DataManager):
             # Populate `storage`
             storage = Storage()
             for i in filter_sorted(writes):
-                if is_ondevice(i, self.device_fit):
+                if is_on_gpu(i, self.gpu_fit):
                     self._map_function_on_high_bw_mem(iet, i, storage)
             for i in filter_sorted(reads):
-                if is_ondevice(i, self.device_fit):
+                if is_on_gpu(i, self.gpu_fit):
                     self._map_function_on_high_bw_mem(iet, i, storage, read_only=True)
 
             iet = self._dump_storage(iet, storage)
@@ -520,7 +520,7 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         o['gpu-direct'] = oo.pop('gpu-direct', False)
 
         # GPU data
-        o['device-fit'] = as_tuple(oo.pop('device-fit', None))
+        o['gpu-fit'] = as_tuple(oo.pop('gpu-fit', None))
 
         if oo:
             raise InvalidOperator("Unsupported optimization options: [%s]"
@@ -701,7 +701,7 @@ class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
 
 # Utils
 
-def is_ondevice(maybe_symbol, device_fit):
+def is_on_gpu(maybe_symbol, gpu_fit):
     """
     True if all functions are allocated in the device memory, False otherwise.
     """
@@ -712,7 +712,7 @@ def is_ondevice(maybe_symbol, device_fit):
         assert maybe_symbol.is_Node
         functions = FindSymbols().visit(maybe_symbol)
 
-    return all(not (f.is_TimeFunction and f.save is not None and f not in device_fit)
+    return all(not (f.is_TimeFunction and f.save is not None and f not in gpu_fit)
                for f in functions)
 
 

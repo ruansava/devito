@@ -26,7 +26,8 @@
     * `cire-mincost-inv` (int, 50): minimum cost of a dimension-invariant candidate
     * `cire-onstack` (boolean, False): control scope of temporary arrays (on the heap by default)
   * Device-specific:
-    * `device-fit` (boolean, False): control movement of saved TimeFunctions between host and device
+    * `gpu-fit` (boolean, False): control movement of saved TimeFunctions between host and device
+    * `gpu-direct` (boolean, False): tells Devito a GPU-aware MPI distribution will be used
 
 ### Optimization parameters by platform
 
@@ -65,4 +66,5 @@
 
 |                     |        CPU          |         GPU        |
 |---------------------|---------------------|--------------------|
-| device-fit          |        :x:          | :heavy_check_mark: |
+| gpu-fit             |        :x:          | :heavy_check_mark: |
+| gpu-direct          |        :x:          | :heavy_check_mark: |
