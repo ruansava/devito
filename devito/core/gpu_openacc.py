@@ -182,8 +182,10 @@ class DeviceOpenACCNoopOperator(DeviceOpenMPNoopOperator):
         if options['mpi']:
             mpiize(graph, mode=options['mpi'])
 
-        # GPU parallelism via OpenACC offloading
-        DeviceAccizer(sregistry, options).make_parallel(graph)
+        # Device and host parallelism via OpenACC offloading
+        accizer = DeviceAccizer(sregistry, options)
+        accizer.make_parallel(graph)
+        accizer.make_orchestration(graph)
 
         # Symbol definitions
         data_manager = DeviceOpenACCDataManager(sregistry, options)
@@ -211,8 +213,10 @@ class DeviceOpenACCOperator(DeviceOpenACCNoopOperator):
         if options['mpi']:
             mpiize(graph, mode=options['mpi'])
 
-        # GPU parallelism via OpenACC offloading
-        DeviceAccizer(sregistry, options).make_parallel(graph)
+        # Device and host parallelism via OpenACC offloading
+        accizer = DeviceAccizer(sregistry, options)
+        accizer.make_parallel(graph)
+        accizer.make_orchestration(graph)
 
         # Misc optimizations
         hoist_prodders(graph)
@@ -232,7 +236,7 @@ class DeviceOpenACCOperator(DeviceOpenACCNoopOperator):
 
 class DeviceOpenACCCustomOperator(DeviceOpenACCOperator):
 
-    _known_passes = ('optcomms', 'openacc', 'c++par', 'mpi', 'prodders')
+    _known_passes = ('optcomms', 'openacc', 'orchestrate', 'mpi', 'prodders')
     _known_passes_disabled = ('blocking', 'openmp', 'denormals', 'simd')
     assert not (set(_known_passes) & set(_known_passes_disabled))
 
@@ -246,6 +250,7 @@ class DeviceOpenACCCustomOperator(DeviceOpenACCOperator):
         return {
             'optcomms': partial(optimize_halospots),
             'openacc': partial(accizer.make_parallel),
+            'orchestrate': partial(accizer.make_orchestration),
             'mpi': partial(mpiize, mode=options['mpi']),
             'prodders': partial(hoist_prodders)
         }

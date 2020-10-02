@@ -175,7 +175,8 @@ class DeviceOmpizer(Ompizer):
         else:
             return super()._make_nested_partree(partree)
 
-    def _make_orchestration(self, iet):
+    @iet_pass
+    def make_orchestration(self, iet):
         partrees = FindNodes(ParallelTree).visit(iet)
         parregions = FindNodes(OpenMPRegion).visit(iet)
 
@@ -569,8 +570,10 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         if options['mpi']:
             mpiize(graph, mode=options['mpi'])
 
-        # GPU parallelism via OpenMP offloading
-        DeviceOmpizer(sregistry, options).make_parallel(graph)
+        # Device and host parallelism via OpenMP offloading
+        ompizer = DeviceOmpizer(sregistry, options)
+        ompizer.make_parallel(graph)
+        ompizer.make_orchestration(graph)
 
         # Symbol definitions
         data_manager = DeviceOpenMPDataManager(sregistry, options)
@@ -597,8 +600,10 @@ class DeviceOpenMPOperator(DeviceOpenMPNoopOperator):
         if options['mpi']:
             mpiize(graph, mode=options['mpi'])
 
-        # GPU parallelism via OpenMP offloading
-        DeviceOmpizer(sregistry, options).make_parallel(graph)
+        # Device and host parallelism via OpenMP offloading
+        ompizer = DeviceOmpizer(sregistry, options)
+        ompizer.make_parallel(graph)
+        ompizer.make_orchestration(graph)
 
         # Misc optimizations
         hoist_prodders(graph)
@@ -623,7 +628,7 @@ class DeviceOpenMPOperator(DeviceOpenMPNoopOperator):
 
 class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
 
-    _known_passes = ('optcomms', 'openmp', 'c++par', 'mpi', 'prodders', 'gpu-direct')
+    _known_passes = ('optcomms', 'openmp', 'orchestrate', 'mpi', 'prodders', 'gpu-direct')
     _known_passes_disabled = ('blocking', 'denormals', 'simd')
     assert not (set(_known_passes) & set(_known_passes_disabled))
 
@@ -637,6 +642,7 @@ class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
         return {
             'optcomms': partial(optimize_halospots),
             'openmp': partial(ompizer.make_parallel),
+            'orchestrate': partial(ompizer.make_orchestration),
             'mpi': partial(mpiize, mode=options['mpi']),
             'prodders': partial(hoist_prodders),
             'gpu-direct': partial(mpi_gpu_direct)
