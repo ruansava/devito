@@ -56,6 +56,8 @@ class DeviceOmpizer(Ompizer):
             c.Pragma('omp target update from(%s%s) device(devicenum)' % (i, j)),
         'map-update-host': lambda i, j:
             c.Pragma('omp target update from(%s%s) device(devicenum)' % (i, j)),
+        'map-update-device': lambda i, j:
+            c.Pragma('omp target update to(%s%s) device(devicenum)' % (i, j)),
         'map-release': lambda i, j:
             c.Pragma('omp target exit data map(release: %s%s) device(devicenum)'
                      % (i, j)),
@@ -105,6 +107,14 @@ class DeviceOmpizer(Ompizer):
         return cls.lang['map-update-host'](f.name, ''.join(ranges))
 
     @classmethod
+    def _map_update_device(cls, f, imask):
+        datasize = cls._map_data(f)
+        assert len(imask) == len(datasize)
+        ranges = ['[%s:%s]' % ((0, j) if i is FULL else (i, 1))
+                  for i, j in zip(imask, datasize)]
+        return cls.lang['map-update-device'](f.name, ''.join(ranges))
+
+    @classmethod
     def _map_release(cls, f):
         return cls.lang['map-release'](f.name, ''.join('[0:%s]' % i
                                                        for i in cls._map_data(f)))
@@ -135,7 +145,7 @@ class DeviceOmpizer(Ompizer):
         assert candidates
         root = candidates[0]
 
-        if is_on_gpu(root, self.gpu_fit):
+        if is_on_gpu(root, self.gpu_fit, only_writes=True):
             # The typical case: all accessed Function's are device Function's, that is
             # all Function's are in the device memory. Then we offload the candidate
             # Iterations to the device
@@ -298,6 +308,53 @@ class DeviceOmpizer(Ompizer):
         too big to be kept in the device memory for the entire duration of
         the computation, thus requiring slices of data to be streamed on and off.
         """
+        # To guard a `partree` from getting offloaded before data living
+        # on the host has been updated
+        threadhost = STDThread('thread')
+        threadwait = List(
+            body=Conditional(DefFunction(FieldFromComposite('joinable', threadhost)),
+                             Call(FieldFromComposite('join', threadhost)))
+        )
+
+        # Process all parallel trees requiring data living on the host
+        mapper = {}
+        for partree in FindNodes(ParallelTree).visit(iet):
+            if is_on_gpu(partree, self.gpu_fit):
+                # All Function's in `partree` on the GPU already, nothing to do
+                continue
+
+            indexeds = FindSymbols('indexeds').visit(partree)
+            onhost = [i for i in indexeds if not is_on_gpu(i, self.gpu_fit)]
+
+            imaskss = build_imask_mapper(onhost, partree)
+
+            copies_init = []
+            copies_prefetch = []
+            for f, imasks in imaskss.items():
+                for imask in imasks:
+                    copies_init.append(self._map_update_device(f, imask))
+
+                    # For the prefetch copy we need to pull the next last
+                    # non-masked iteration
+                    n = 0
+                    for i in reversed(imask):
+                        if i is FULL:
+                            continue
+                        n = imask.index(i)
+                        break
+                    imask_prefetch = imask[:n] + (imask[n] + 1,) + imask[n+1:]
+                    copies_prefetch.append(self._map_update_device(f, imask_prefetch))
+
+            efunc = ElementalFunction('copy_host_to_device%d' % len(mapper),
+                                      List(header=copies_prefetch), 'void', list(imaskss))
+            call = Call('std::thread', efunc.make_call(is_indirect=True),
+                        retobj=threadhost)
+
+            mapper[partree] = List(body=[threadwait, partree, call])
+
+        iet = Transformer(mapper).visit(iet)
+        from IPython import embed; embed()
+
         return iet, {}
 
     @iet_pass
@@ -725,16 +782,32 @@ class DeviceOpenMPCustomOperator(DeviceOpenMPOperator):
 
 # Utils
 
-def is_on_gpu(maybe_symbol, gpu_fit):
+def is_on_gpu(maybe_symbol, gpu_fit, only_writes=False):
     """
-    True if all functions are allocated in the device memory, False otherwise.
+    True if all Function's are allocated in the device memory, False otherwise.
+
+    Parameters
+    ----------
+    maybe_symbol : Indexed or Function or Node
+        The inspected object. May be a single Indexed or Function, or even an
+        entire piece of IET.
+    gpu_fit : list of Function
+        The Function's which are known to definitely fit in the device memory. This
+        information is given directly by the user through the compiler option
+        `gpu-fit` and is propagated down here through the various stages of lowering.
+    only_writes : boo, optional
+        Only makes sense if `maybe_symbol` is an IET. If True, ignore all Function's
+        that do not appear on the LHS of at least one Expression. Defaults to False.
     """
-    # `maybe_symbol` may be an Indexed, a Function, or even an actual piece of IET
     try:
         functions = (maybe_symbol.function,)
     except AttributeError:
         assert maybe_symbol.is_Node
-        functions = FindSymbols().visit(maybe_symbol)
+        iet = maybe_symbol
+        functions = set(FindSymbols().visit(iet))
+        if only_writes:
+            expressions = FindNodes(Expression).visit(iet)
+            functions &= {i.write for i in expressions}
 
     return all(not (f.is_TimeFunction and f.save is not None and f not in gpu_fit)
                for f in functions)
@@ -746,7 +819,7 @@ def build_imask_mapper(indexeds, root):
     given a Dimension `d` and the corresponding index `i`,
 
         * if `d` is a device-offloaded Dimension, then the mask abstracts away
-          the index using the special object FULL
+          the index with the special placeholder FULL
         * if, instead, `d` is a sequential (or simply non-offloaded) Dimension, then
           the mask will use `i`.
 
