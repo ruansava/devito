@@ -11,9 +11,9 @@ from devito.core.operator import OperatorCore
 from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
-from devito.ir.iet import (Block, Call, Callable, Conditional, ElementalFunction, Expression,
-                           List, LocalExpression, While, FindNodes, FindSymbols,
-                           MapExprStmts, Transformer, make_efunc)
+from devito.ir.iet import (Block, Call, Callable, Conditional, ElementalFunction,
+                           Expression, List, LocalExpression, While, FindNodes,
+                           FindSymbols, MapExprStmts, Transformer, make_efunc)
 from devito.logger import warning
 from devito.mpi.distributed import MPICommObject
 from devito.mpi.routines import (CopyBuffer, HaloUpdate, IrecvCall, IsendCall, SendRecv,
@@ -23,9 +23,10 @@ from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_i
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, OpenMPRegion, optimize_halospots,
                                mpiize, hoist_prodders, iet_pass)
-from devito.symbolics import CondEq, DefFunction, FieldFromComposite, ListInitializer
+from devito.symbolics import (Byref, CondEq, DefFunction, FieldFromComposite,
+                              ListInitializer)
 from devito.tools import as_tuple, filter_sorted, timed_pass
-from devito.types import Array, CustomDimension, LocalObject
+from devito.types import Array, CustomDimension, LocalObject, Symbol
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
