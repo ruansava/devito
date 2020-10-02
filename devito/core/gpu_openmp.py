@@ -175,8 +175,11 @@ class DeviceOmpizer(Ompizer):
         else:
             return super()._make_nested_partree(partree)
 
-    @iet_pass
-    def make_orchestration(self, iet):
+    def _make_sync_host(self, iet):
+        """
+        Update host data so that non-offloaded parallel loops are executed
+        with up-to-date data.
+        """
         partrees = FindNodes(ParallelTree).visit(iet)
         parregions = FindNodes(OpenMPRegion).visit(iet)
 
@@ -287,6 +290,27 @@ class DeviceOmpizer(Ompizer):
         iet = iet._rebuild(body=(locks_init,) + iet.body + (threadwait,))
 
         return iet, {'efuncs': efuncs, 'includes': ['thread']}
+
+    def _make_sync_device(self, iet):
+        """
+        Update device data so that offloaded parallel loops are executed
+        with up-to-date data. This is required for those Function's which are
+        too big to be kept in the device memory for the entire duration of
+        the computation, thus requiring slices of data to be streamed on and off.
+        """
+        return iet, {}
+
+    @iet_pass
+    def make_orchestration(self, iet):
+        iet, metadata0 = self._make_sync_host(iet)
+        iet, metadata1 = self._make_sync_device(iet)
+
+        metadata = defaultdict(list)
+        for m in [metadata0, metadata1]:
+            for k, v in m.items():
+                metadata[k].extend(v)
+
+        return iet, metadata
 
 
 class DeviceOpenMPDataManager(DataManager):
