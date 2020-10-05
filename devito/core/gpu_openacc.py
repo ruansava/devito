@@ -70,19 +70,14 @@ class DeviceAccizer(DeviceOmpizer):
     _Iteration = DeviceOpenACCIteration
 
     @classmethod
-    def _map_present(cls, f):
-        # TODO: currently this is unused, because we cannot yet distinguish between
-        # "real" Arrays and Functions that "acts as Arrays", created by the compiler
-        # to build support routines (e.g., the Sendrecv/Gather/Scatter MPI Callables).
-        # We should only use "#pragma acc present" for *real* Arrays -- that is
-        # temporaries that are born and die on the Device
-        return cls.lang['map-present'](f.name, ''.join('[0:%s]' % i
-                                                       for i in cls._map_data(f)))
+    def _map_present(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        return cls.lang['map-present'](f.name, sections)
 
     @classmethod
-    def _map_delete(cls, f):
-        return cls.lang['map-exit-delete'](f.name, ''.join('[0:%s]' % i
-                                                           for i in cls._map_data(f)))
+    def _map_delete(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        return cls.lang['map-exit-delete'](f.name, sections)
 
     @classmethod
     def _map_pointers(cls, functions):

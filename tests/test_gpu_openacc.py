@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 
 from conftest import skipif
-from devito import (Grid, Constant, Function, TimeFunction, Eq, Operator,
+from devito import (Grid, Constant, Function, TimeFunction, Eq, Inc, Operator,
                     ConditionalDimension, norm, solve)
 from devito.data import LEFT
 from devito.ir.iet import FindNodes, retrieve_iteration_tree
@@ -138,6 +138,28 @@ class TestCodeGeneration(object):
             ('acc exit data delete(usave[0:usave_vec->size[0]]'
              '[0:usave_vec->size[1]][0:usave_vec->size[2]][0:usave_vec->size[3]])')
 
+    @pytest.mark.parametrize('subdomain', ['domain', 'interior'])
+    def test_xcor_from_saved(self, subdomain):
+        nt = 10
+
+        grid = Grid(shape=(10, 10, 10))
+        time_dim = grid.time_dim
+
+        period = 2
+        factor = Constant(name='factor', value=period, dtype=np.int32)
+        time_sub = ConditionalDimension(name="time_sub", parent=time_dim, factor=factor)
+
+        g = Function(name='g', grid=grid)
+        v = TimeFunction(name='v', grid=grid)
+        usave = TimeFunction(name='usave', grid=grid, time_order=0,
+                             save=int(nt//factor.data), time_dim=time_sub)
+
+        eqns = [Eq(v.backward, v + 1, subdomain=grid.subdomains[subdomain]),
+                Inc(g, usave*v, subdomain=grid.subdomains[subdomain])]
+
+        op = Operator(eqns, platform='nvidiaX', language='openacc')
+        from IPython import embed; embed()
+
 
 class TestOperator(object):
 
@@ -180,6 +202,39 @@ class TestOperator(object):
         op.apply(time_M=nt-1)
 
         assert all(np.all(usave.data[i] == 2*i + 1) for i in range(usave.save))
+
+    @skipif('nodevice')
+    @pytest.mark.parametrize('gpu_fit', [True, False])
+    def test_xcor_from_saved(self, gpu_fit):
+        nt = 10
+
+        grid = Grid(shape=(10, 10, 10))
+        time_dim = grid.time_dim
+
+        period = 2
+        factor = Constant(name='factor', value=period, dtype=np.int32)
+        time_sub = ConditionalDimension(name="time_sub", parent=time_dim, factor=factor)
+
+        g = Function(name='g', grid=grid)
+        v = TimeFunction(name='v', grid=grid)
+        usave = TimeFunction(name='usave', grid=grid, time_order=0,
+                             save=int(nt//factor.data), time_dim=time_sub)
+
+        for i in range(int(nt//period)):
+            usave.data[i, :] = i
+        v.data[:] = i*2 + 1
+
+        # Assuming nt//period=5, we are computing, over 5 iterations:
+        # g = 4*4  [time=8] + 3*3 [time=6] + 2*2 [time=4] + 1*1 [time=2]
+        eqns = [Eq(v.backward, v - 1), Inc(g, usave*(v/2))]
+
+        op = Operator([Eq(v.backward, v - 1), Inc(g, usave*(v/2))],
+                      platform='nvidiaX', language='openacc',
+                      opt=('advanced', {'gpu-fit': usave if gpu_fit else None}))
+
+        op.apply(time_M=nt-1)
+
+        assert np.all(g.data == 30)
 
     @skipif('nodevice')
     def test_iso_ac(self):

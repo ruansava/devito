@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from functools import partial, singledispatch
 
 from ctypes import c_void_p
@@ -12,8 +12,10 @@ from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import (Block, Call, Callable, Conditional, ElementalFunction,
-                           Expression, List, LocalExpression, While, FindNodes,
-                           FindSymbols, MapExprStmts, Transformer, make_efunc)
+                           Expression, ExpressionBundle, List, LocalExpression, While,
+                           PointerCast, FindNodes, FindSymbols, MapExprStmts,
+                           Transformer, make_efunc, derive_parameters)
+from devito.ir.support import Backward
 from devito.logger import warning
 from devito.mpi.distributed import MPICommObject
 from devito.mpi.routines import (CopyBuffer, HaloUpdate, IrecvCall, IsendCall, SendRecv,
@@ -24,8 +26,8 @@ from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, OpenMPRegion, optimize_halospots,
                                mpiize, hoist_prodders, iet_pass)
 from devito.symbolics import (Byref, CondEq, DefFunction, FieldFromComposite,
-                              ListInitializer)
-from devito.tools import as_tuple, filter_sorted, timed_pass
+                              ListInitializer, ccode)
+from devito.tools import DefaultOrderedDict, as_tuple, filter_sorted, timed_pass
 from devito.types import Array, CustomDimension, LocalObject, Symbol
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
@@ -73,6 +75,16 @@ class DeviceOmpizer(Ompizer):
         self.gpu_fit = options['gpu-fit']
 
     @classmethod
+    def _make_sections_from_imask(cls, f, imask):
+        datasize = cls._map_data(f)
+        if imask is None:
+            imask = [FULL]*len(datasize)
+        assert len(imask) == len(datasize)
+        sections = ['[%s:%s]' % ((0, j) if i is FULL else (ccode(i), 1))
+                    for i, j in zip(imask, datasize)]
+        return ''.join(sections)
+
+    @classmethod
     def _map_data(cls, f):
         if f.is_Array:
             return f.symbolic_shape
@@ -80,14 +92,14 @@ class DeviceOmpizer(Ompizer):
             return tuple(f._C_get_field(FULL, d).size for d in f.dimensions)
 
     @classmethod
-    def _map_to(cls, f):
-        return cls.lang['map-enter-to'](f.name, ''.join('[0:%s]' % i
-                                                        for i in cls._map_data(f)))
+    def _map_to(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        return cls.lang['map-enter-to'](f.name, sections)
 
     @classmethod
-    def _map_alloc(cls, f):
-        return cls.lang['map-enter-alloc'](f.name, ''.join('[0:%s]' % i
-                                                           for i in cls._map_data(f)))
+    def _map_alloc(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        return cls.lang['map-enter-alloc'](f.name, sections)
 
     @classmethod
     def _map_present(cls, f):
@@ -99,20 +111,14 @@ class DeviceOmpizer(Ompizer):
                                                       for i in cls._map_data(f)))
 
     @classmethod
-    def _map_update_host(cls, f, imask):
-        datasize = cls._map_data(f)
-        assert len(imask) == len(datasize)
-        ranges = ['[%s:%s]' % ((0, j) if i is FULL else (i, 1))
-                  for i, j in zip(imask, datasize)]
-        return cls.lang['map-update-host'](f.name, ''.join(ranges))
+    def _map_update_host(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        return cls.lang['map-update-host'](f.name, sections)
 
     @classmethod
-    def _map_update_device(cls, f, imask):
-        datasize = cls._map_data(f)
-        assert len(imask) == len(datasize)
-        ranges = ['[%s:%s]' % ((0, j) if i is FULL else (i, 1))
-                  for i, j in zip(imask, datasize)]
-        return cls.lang['map-update-device'](f.name, ''.join(ranges))
+    def _map_update_device(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        return cls.lang['map-update-device'](f.name, sections)
 
     @classmethod
     def _map_release(cls, f):
@@ -120,13 +126,13 @@ class DeviceOmpizer(Ompizer):
                                                        for i in cls._map_data(f)))
 
     @classmethod
-    def _map_delete(cls, f):
-        data = ''.join('[0:%s]' % i for i in cls._map_data(f))
+    def _map_delete(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
         # This ugly condition is to avoid a copy-back when, due to
         # domain decomposition, the local size of a Function is 0, which
         # would cause a crash
         cond = ' if(1%s)' % ''.join(' && (%s != 0)' % i for i in cls._map_data(f))
-        return cls.lang['map-exit-delete'](f.name, data, cond)
+        return cls.lang['map-exit-delete'](f.name, sections, cond)
 
     @classmethod
     def _map_pointers(cls, f):
@@ -195,8 +201,8 @@ class DeviceOmpizer(Ompizer):
         partrees = FindNodes(ParallelTree).visit(iet)
         parregions = FindNodes(OpenMPRegion).visit(iet)
 
-        wmapper = defaultdict(dict)
-        rmapper = defaultdict(dict)
+        wmapper = DefaultOrderedDict(dict)
+        rmapper = DefaultOrderedDict(dict)
         for parregion in parregions:
             assert type(parregion.root) is OpenMPIteration
 
@@ -313,17 +319,22 @@ class DeviceOmpizer(Ompizer):
         # To guard a `partree` from getting offloaded before data living
         # on the host has been updated
         threadhost = STDThread('thread')
-        threadwait = List(
-            body=Conditional(DefFunction(FieldFromComposite('joinable', threadhost)),
-                             Call(FieldFromComposite('join', threadhost)))
-        )
+        threadwait = Call(FieldFromComposite('join', threadhost))
 
         # Process all parallel trees requiring data living on the host
+        copyin = []
         mapper = {}
+        efuncs = []
         for partree in FindNodes(ParallelTree).visit(iet):
             if is_on_gpu(partree, self.gpu_fit):
                 # All Function's in `partree` on the GPU already, nothing to do
                 continue
+
+            bundles = FindNodes(ExpressionBundle).visit(partree)
+            assert len(bundles) > 0
+            # We only use `ispace` for the Iteration's outside `partree`, so any
+            # `bundle` is fine
+            ispace = bundles.pop().ispace
 
             indexeds = FindSymbols('indexeds').visit(partree)
             onhost = [i for i in indexeds if not is_on_gpu(i, self.gpu_fit)]
@@ -331,33 +342,99 @@ class DeviceOmpizer(Ompizer):
             imaskss = build_imask_mapper(onhost, partree)
 
             copies_init = []
+            presents = []
+            deletions = []
             copies_prefetch = []
             for f, imasks in imaskss.items():
                 for imask in imasks:
-                    copies_init.append(self._map_update_device(f, imask))
-
-                    # For the prefetch copy we need to pull the next last
-                    # non-masked iteration
+                    # For the init copy we need to pull the *first* iteration
+                    # along the last non-masked Dimension; for the prefetch copy
+                    # we need pull the *next* iteration again along the last non
+                    # non-masked Dimension
                     n = 0
                     for i in reversed(imask):
                         if i is FULL:
                             continue
                         n = imask.index(i)
                         break
-                    imask_prefetch = imask[:n] + (imask[n] + 1,) + imask[n+1:]
-                    copies_prefetch.append(self._map_update_device(f, imask_prefetch))
 
-            efunc = ElementalFunction('copy_host_to_device%d' % len(mapper),
-                                      List(header=copies_prefetch), 'void', list(imaskss))
-            call = Call('std::thread', efunc.make_call(is_indirect=True),
-                        retobj=threadhost)
+                    # Determine what the next iteration to fetch is and create
+                    # guard to avoid OOB prefetches
+                    d = f.dimensions[n].root
+                    if ispace.directions[d] is Backward:
+                        init = imask[n].subs(d, d.symbolic_max)
+                        init_cond = init >= d.symbolic_min
+                        prefetch = imask[n] - 1
+                        prefetch_cond = prefetch >= d.symbolic_min
+                    else:
+                        init = imask[n].subs(d, d.symbolic_min)
+                        init_cond = init <= d.symbolic_max
+                        prefetch = imask[n] + 1
+                        prefetch_cond = prefetch <= d.symbolic_max
 
-            mapper[partree] = List(body=[threadwait, partree, call])
+                    # Construct init IET
+                    imask_init = imask[:n] + (init,) + imask[n+1:]
+                    copy = List(header=self._map_to(f, imask_init))
+                    copies_init.append(Conditional(init_cond, copy))
+
+                    # Construct `deletion` and `present` clauses
+                    deletions.append(self._map_delete(f, imask))
+                    presents.append(self._map_present(f, imask))
+
+                    # Construct prefetch IET
+                    imask_prefetch = imask[:n] + (prefetch,) + imask[n+1:]
+                    copy = List(header=self._map_to(f, imask_prefetch))
+                    copies_prefetch.append(Conditional(prefetch_cond, copy))
+
+            # Turn init IET into an efunc
+            casts = [PointerCast(i) for i in imaskss]
+            body = List(body=casts + copies_init)
+            parameters = filter_sorted(list(imaskss) + derive_parameters(body))
+            init_efunc = ElementalFunction('init_device%d' % len(mapper),
+                                           body, 'void', parameters)
+            copyin.append(Call('std::thread',
+                               init_efunc.make_call(is_indirect=True),
+                               retobj=threadhost))
+
+            # Turn prefetch IET into an efunc
+            body = List(body=casts + copies_prefetch)
+            parameters = filter_sorted(list(imaskss) + derive_parameters(body))
+            prefetch_efunc = ElementalFunction('prefetch_host_to_device%d' % len(mapper),
+                                               body, 'void', parameters)
+            prefetch_call = Call('std::thread',
+                                 prefetch_efunc.make_call(is_indirect=True),
+                                 retobj=threadhost)
+
+            # Prepend `present` clauses
+            ppartree = partree._rebuild(prefix=(List(header=presents),) + partree.prefix)
+
+            mapper[partree] = List(
+                header=[c.Line(),
+                        c.Comment("Wait for host thread to be available again")],
+                body=[threadwait, List(
+                    header=c.Line(),
+                    body=[ppartree, List(
+                        header=([c.Line()] + deletions +
+                                [c.Line(), c.Comment("Spawn thread to prefetch data")]),
+                        body=prefetch_call,
+                        footer=c.Line()
+                    )]
+                )]
+            )
+            efuncs.extend([init_efunc, prefetch_efunc])
+
+        if not mapper:
+            return iet, {}
 
         iet = Transformer(mapper).visit(iet)
-        from IPython import embed; embed()
 
-        return iet, {}
+        copyin = List(body=copyin, footer=c.Line())
+        threadwait = List(header=[c.Line(),
+                                  c.Comment("Wait for completion of host thread")],
+                          body=threadwait)
+        iet = iet._rebuild(body=(copyin,) + iet.body + (threadwait,))
+
+        return iet, {'efuncs': efuncs, 'includes': ['thread']}
 
     @iet_pass
     def make_orchestration(self, iet):
@@ -836,7 +913,7 @@ def build_imask_mapper(indexeds, root):
     v[t1, x, 0, z]]`. Then the imask mapper will be `{u(t, x, ,y, z): [(t1, FULL,
     FULL, FULL), (t2, FULL, FULL, FULL)], v(t, x, y, z): [(t1, FULL, FULL, FULL)]}`.
     """
-    imasks = defaultdict(set)
+    imasks = DefaultOrderedDict(set)
     for indexed in indexeds:
         f = indexed.function
         if not f.is_DiscreteFunction:
@@ -862,7 +939,7 @@ class STDThread(LocalObject):
     _pickle_args = ['name']
 
 
-class Locks(dict):
+class Locks(OrderedDict):
 
     """
     A simple mapper between Function's and locks to make sure we have
