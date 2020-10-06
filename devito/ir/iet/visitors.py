@@ -538,7 +538,7 @@ class MapNodes(Visitor):
 class FindSymbols(Visitor):
 
     class Retval(list):
-        def __init__(self, *retvals, key=None, node=None):
+        def __init__(self, *retvals, node=None):
             elements = []
             self.mapper = {}
             for i in retvals:
@@ -547,7 +547,7 @@ class FindSymbols(Visitor):
                 except AttributeError:
                     pass
                 elements.extend(i)
-            elements = filter_ordered(elements, key=key)
+            elements = filter_sorted(elements, key=str)
             if node is not None:
                 self.mapper[node] = tuple(elements)
             super().__init__(elements)
@@ -611,7 +611,7 @@ class FindSymbols(Visitor):
                            self.rule(o), self.rule(o.condition), node=o)
 
     def visit_Expression(self, o):
-        return self.Retval([f for f in self.rule(o)], key=attrgetter('name'))
+        return self.Retval([f for f in self.rule(o)])
 
     visit_PointerCast = visit_Expression
     visit_Dereference = visit_Expression
