@@ -3,8 +3,9 @@ from functools import partial, singledispatch
 
 from ctypes import c_void_p
 import cgen as c
-from sympy import Function
 import numpy as np
+from sympy import Function
+from sympy.tensor.indexed import IndexException
 import sympy
 
 from devito.core.operator import OperatorCore
@@ -951,19 +952,24 @@ class Locks(OrderedDict):
         super().__init__(*args, **kwargs)
 
     def makedefault(self, f, imask):
-        # The lock-protected Dimension's
+        # The lock-protected Dimensions
         locked = [i for i in imask if i is not FULL]
 
         if f not in self:
             name = self.make_name(prefix='%s_lock' % f.name)
 
-            n = len(locked)
-            dims = []
-            for d, s in zip(f.dimensions[:n], f.shape[:n]):
-                if d.is_Stepping:
-                    dims.append(CustomDimension(name=d.name, symbolic_size=s))
-                else:
-                    dims.append(d)
+            if locked:
+                n = len(locked)
+                dims = []
+                for d, s in zip(f.dimensions[:n], f.shape[:n]):
+                    if d.is_Stepping:
+                        dims.append(CustomDimension(name=d.name, symbolic_size=s))
+                    else:
+                        dims.append(d)
+            else:
+                # Would degenerate to a Scalar, but we rather use an Array
+                # of size 1 for simplicity
+                dims = [CustomDimension(name='d', symbolic_size=1)]
 
             self[f] = Array(
                 name=name, dimensions=dims, dtype=np.int32,
@@ -972,4 +978,8 @@ class Locks(OrderedDict):
                 padding=0,  # Bypass `autopadding` which is useless here
             )
 
-        return self[f][locked]
+        try:
+            return self[f][locked]
+        except IndexException:
+            assert self[f].size == 1
+            return self[f][0]
