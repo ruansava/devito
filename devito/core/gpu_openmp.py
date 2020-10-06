@@ -121,10 +121,12 @@ class DeviceOmpizer(Ompizer):
 
     @classmethod
     def _map_delete(cls, f):
-        return cls.lang['map-exit-delete'](f.name, ''.join('[0:%s]' % i for i in
-                                                           cls._map_data(f)), ' if(1%s)' %
-                                           ''.join(' && (%s != 0)' % i for i in
-                                                   cls._map_data(f)))
+        data = ''.join('[0:%s]' % i for i in cls._map_data(f))
+        # This ugly condition is to avoid a copy-back when, due to
+        # domain decomposition, the local size of a Function is 0, which
+        # would cause a crash
+        cond = ' if(1%s)' % ''.join(' && (%s != 0)' % i for i in cls._map_data(f))
+        return cls.lang['map-exit-delete'](f.name, data, cond)
 
     @classmethod
     def _map_pointers(cls, f):
