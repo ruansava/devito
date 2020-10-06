@@ -131,7 +131,7 @@ class DeviceOmpizer(Ompizer):
         # This ugly condition is to avoid a copy-back when, due to
         # domain decomposition, the local size of a Function is 0, which
         # would cause a crash
-        cond = ' if(1%s)' % ''.join(' && (%s != 0)' % i for i in cls._map_data(f))
+        cond = ' if(%s)' % ' && '.join('(%s != 0)' % i for i in cls._map_data(f))
         return cls.lang['map-exit-delete'](f.name, sections, cond)
 
     @classmethod
