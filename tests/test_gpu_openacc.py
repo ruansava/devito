@@ -3,7 +3,7 @@ import numpy as np
 
 from conftest import skipif
 from devito import (Grid, Constant, Function, TimeFunction, Eq, Inc, Operator,
-                    ConditionalDimension, norm, solve)
+                    ConditionalDimension, SubDomain, norm, solve)
 from devito.data import LEFT
 from devito.ir.iet import FindNodes, retrieve_iteration_tree
 from devito.passes.iet import OpenMPIteration
@@ -209,6 +209,35 @@ class TestOperator(object):
                       opt=('advanced', {'gpu-fit': usave if gpu_fit else None}))
 
         op.apply(time_M=nt-1)
+
+        assert np.all(g.data == 30)
+
+    @skipif('nodevice')
+    def test_save_whole_field_split(self):
+        nt = 10
+
+        # We use a subdomain to enforce Eqs to end up in different loops
+        class Bundle(SubDomain):
+            name = 'bundle'
+
+            def define(self, dimensions):
+                x, y, z = dimensions
+                return {x: ('middle', 0, 0), y: ('middle', 0, 0), z: ('middle', 0, 0)}
+
+        bundle0 = Bundle()
+        grid = Grid(shape=(10, 10, 10), subdomains=bundle0)
+
+        tmp = Function(name='tmp', grid=grid)
+        u = TimeFunction(name='u', grid=grid, save=nt)
+
+        # `u` uses `save` so by default it lives on the host. This implies
+        # that only the first equation gets computed on the device (clearly
+        # `tmp` lives on the device), while the second one gets computed
+        # asynchronously on the host once the data (`tmp`)has been streamed back
+        op = Operator([Eq(tmp, u + 1), Eq(u.forward, tmp, subdomain=bundle0)],
+                      platform='nvidiaX', language='openacc')
+
+        op.apply(time_M=nt-2)
 
         assert np.all(g.data == 30)
 
