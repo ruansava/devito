@@ -1,5 +1,7 @@
 from collections import OrderedDict
 
+from cached_property import cached_property
+
 from devito.ir.equations import DummyEq
 from devito.ir.clusters import Queue
 from devito.ir.support import SEQUENTIAL, Scope
@@ -79,7 +81,13 @@ class Buffering(Queue):
             return clusters
 
         # Map buffered Functions to their reading and last-writing Cluster
-        mapper = BufferMapper(clusters, d)
+        #TODO: rollback to wmapper and rmapper
+        #TODO: then create mapper[f] = Buffer(f, d, wmapper[f], rmapper[f])
+        #TODO: then in the constructor of Buffer do create the actual Buffer
+        #TODO: this will make Buffer immutable (at last!!!)
+        #TODO: will also compute slots and create mds. Will have a mapper between
+        #TODO: slots (eg time+1) and mds (eg d0 representing (time+1)%2)
+        mapper = BufferMapper(d)
         for c in clusters:
             for f in c.scope.writes:
                 if self.key(f):
@@ -90,7 +98,8 @@ class Buffering(Queue):
 
         # Create buffers
         for f, b in mapper.items():
-            bd = CustomDimension(name='db%d' % mapper.nbuffers, symbolic_size=b.size())
+            bd = CustomDimension(name='db%d' % mapper.nbuffers,
+                                 symbolic_size=b.compute_size())
             dims = list(f.dimensions)
             try:
                 dims[f.dimensions.index(d)] = bd
@@ -106,15 +115,22 @@ class Buffering(Queue):
             for i in range(b.size()):
                 indices = list(f.dimensions)
                 indices[b.bdindex] = i
-                init.append(DummyEq(bmapper[f][indices], f[indices]))
-
-        from IPython import embed; embed()
+                init.append(DummyEq(b.buffer[indices], f[indices]))
 
         # Create Eqs to dump `bf` back into `f`
         dump = []
+        for c, buffereds in mapper.as_lastwrite_mapper().items():
+            for b in buffereds:
+                writes = list(c.scope.writes[b.function])
+                if len(writes) != 1:
+                    raise NotImplementedError
+                write = writes.pop()
+                indices = list(b.function.dimensions)
+                indices[b.bdindex] = indices[b.bdindex] + 
+                dum
+                from IPython import embed; embed()
 
         # Create replacements
-        mds = [ModuloDimension(d, i, len(k), name='d%d' % n) for n, i in enumerate(k)]
 
 
 class BufferMapper(OrderedDict):
@@ -126,11 +142,17 @@ class BufferMapper(OrderedDict):
     def __getitem__(self, function):
         if function not in self:
             super().__setitem__(function, Buffered(function, self.dim))
-        return self[function]
+        return super().__getitem__(function)
 
     @property
     def nbuffers(self):
         return len([b for b in self.values() if b.buffer is not None])
+
+    def as_lastwrite_mapper(self):
+        ret = DefaultOrderedDict(list)
+        for b in self.values():
+            ret[b.lastwrite].append(b)
+        return ret
 
 
 class Buffered(object):
@@ -162,9 +184,10 @@ class Buffered(object):
 
     @property
     def is_readwrite(self):
+        #TODO
         pass
 
-    @property
+    @cached_property
     def bdindex(self):
         """
         The buffer Dimension index within the buffer.
@@ -175,10 +198,20 @@ class Buffered(object):
                 return n
         assert False
 
-    def size(self):
-        if self.buffer is not None:
-            return self.buffer.shape[self.bdindex]
+    @cached_property
+    def mds(self):
+        #TODO: cannot do range(self.size) ... I must check the slots so that
+        # I have -1, 0, 1 ...
+        assert self.buffer is not None
+        return [ModuloDimension(self.dim, i, self.size, name='d%d' % n)
+                for n, i in range(self.size)]
 
+    @cached_property
+    def size(self):
+        assert self.buffer is not None:
+        return self.buffer.shape[self.bdindex]
+
+    def compute_size(self):
         slots = set()
         for c in [self.lastwrite] + self.readby:
             accesses = c.scope.getreads(self.function) + c.scope.getwrites(self.function)
