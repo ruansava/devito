@@ -15,8 +15,8 @@ from devito.logger import warning
 from devito.mpi.distributed import MPICommObject
 from devito.mpi.routines import (CopyBuffer, HaloUpdate, IrecvCall, IsendCall, SendRecv,
                                  MPICallable)
-from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_increments,
-                                    factorize, fuse, optimize_pows)
+from devito.passes.clusters import (Buffering, Lift, cire, cse, eliminate_arrays,
+                                    extract_increments, factorize, fuse, optimize_pows)
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
@@ -431,6 +431,11 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         # further optimizations
         clusters = fuse(clusters)
         clusters = eliminate_arrays(clusters)
+
+        # Replace host Functions with Arrays, used as device buffers for
+        # streaming-in and -out of data
+        key = lambda i: not is_on_gpu(i, options['gpu-fit'])
+        clusters = Buffering(key=key).process(clusters)
 
         return clusters
 
