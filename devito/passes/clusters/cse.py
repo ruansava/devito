@@ -1,4 +1,4 @@
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 from devito.ir import DummyEq, Cluster, Scope
 from devito.passes.clusters.utils import cluster_pass, makeit_ssa
