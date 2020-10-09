@@ -2,11 +2,11 @@ from collections import OrderedDict
 
 from cached_property import cached_property
 
-from devito.ir.equations import DummyEq
-from devito.ir.clusters import Queue
+from devito.ir.equations import DummyEq, LoweredEq, lower_exprs
+from devito.ir.clusters import Queue, clusterize
 from devito.ir.support import SEQUENTIAL, Scope
-from devito.tools import DefaultOrderedDict, flatten, timed_pass
-from devito.types import Array, CustomDimension, ModuloDimension
+from devito.tools import DefaultOrderedDict, filter_ordered, flatten, timed_pass
+from devito.types import Array, CustomDimension, Eq, ModuloDimension
 
 __all__ = ['Buffering']
 
@@ -80,73 +80,57 @@ class Buffering(Queue):
         if not all(SEQUENTIAL in c.properties[d] for c in clusters):
             return clusters
 
-        # Map buffered Functions to their reading and last-writing Cluster
-        #TODO: rollback to wmapper and rmapper
-        #TODO: then create mapper[f] = Buffer(f, d, wmapper[f], rmapper[f])
-        #TODO: then in the constructor of Buffer do create the actual Buffer
-        #TODO: this will make Buffer immutable (at last!!!)
-        #TODO: will also compute slots and create mds. Will have a mapper between
-        #TODO: slots (eg time+1) and mds (eg d0 representing (time+1)%2)
-        mapper = BufferMapper(d)
+        # Locate and classify all buffered Function accesses within the `clusters`
+        lastwrite = DefaultOrderedDict(lambda: None)
+        readby = DefaultOrderedDict(list)
         for c in clusters:
             for f in c.scope.writes:
                 if self.key(f):
-                    mapper[f].lastwrite = c
+                    lastwrite[f] = c
             for f in c.scope.reads:
                 if self.key(f):
-                    mapper[f].readby.append(c)
+                    readby[f].append(c)
 
-        # Create buffers
-        for f, b in mapper.items():
-            bd = CustomDimension(name='db%d' % mapper.nbuffers,
-                                 symbolic_size=b.compute_size())
-            dims = list(f.dimensions)
-            try:
-                dims[f.dimensions.index(d)] = bd
-            except ValueError:
-                dims.insert(0, bd)
-            mapper[f].buffer = Array(name='%sb' % f.name, dimensions=dims, dtype=f.dtype)
+        # Create the buffers
+        functions = filter_ordered(list(lastwrite) + list(readby))
+        mapper = BufferMapper([(f, Buffer(f, d, lastwrite[f], readby[f], n))
+                               for n, f in enumerate(functions)])
 
         # Create Eqs to initialize `bf` if `f` is a read-write Function
-        init = []
+        exprs = []
         for f, b in mapper.items():
             if b.is_readonly:
                 continue
-            for i in range(b.size()):
-                indices = list(f.dimensions)
-                indices[b.bdindex] = i
-                init.append(DummyEq(b.buffer[indices], f[indices]))
+            indices = list(f.dimensions)
+            indices[b.index] = b.bdim
+            eq = Eq(b.buffer[indices], b.function[indices])
+            exprs.append(LoweredEq(lower_exprs(eq)))
+        processed = list(clusterize(exprs)) + clusters
 
-        # Create Eqs to dump `bf` back into `f`
-        dump = []
+        # Create Eqs to copy back `bf` into `f`
         for c, buffereds in mapper.as_lastwrite_mapper().items():
+            exprs = []
             for b in buffereds:
                 writes = list(c.scope.writes[b.function])
                 if len(writes) != 1:
                     raise NotImplementedError
                 write = writes.pop()
-                indices = list(b.function.dimensions)
-                indices[b.bdindex] = indices[b.bdindex] + 
-                dum
-                from IPython import embed; embed()
+
+                indices = list(write.indexed.indices)
+                indices[b.index] = b.mds_mapper[indices[b.index]]
+                exprs.append(DummyEq(write.indexed, b.buffer[indices]))
+
+            sub_iterators = filter_ordered(flatten(b.mds for b in buffereds))
+            ispace = c.ispace.augment({d: sub_iterators})
+
+            processed.insert(processed.index(c)+1,
+                             c.rebuild(exprs=exprs, ispace=ispace))
+        from IPython import embed; embed()
 
         # Create replacements
 
 
 class BufferMapper(OrderedDict):
-
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def __getitem__(self, function):
-        if function not in self:
-            super().__setitem__(function, Buffered(function, self.dim))
-        return super().__getitem__(function)
-
-    @property
-    def nbuffers(self):
-        return len([b for b in self.values() if b.buffer is not None])
 
     def as_lastwrite_mapper(self):
         ret = DefaultOrderedDict(list)
@@ -155,11 +139,10 @@ class BufferMapper(OrderedDict):
         return ret
 
 
-class Buffered(object):
+class Buffer(object):
 
     """
-    This is a mutable data structure, which gets updated during the compilation
-    pass as more information about the required buffer are determined.
+    A buffer with useful metadata attached.
 
     Parameters
     ----------
@@ -167,16 +150,55 @@ class Buffered(object):
         The object for which a buffer is created.
     dim : Dimension
         The Dimension along which the buffer is created.
+    lastwrite : Cluster
+        The last Cluster (in program order) performing a write to `function`.
+    readby : list of Cluster
+        All Clusters reading `function`.
+    n : int
+        A unique identifier for this Buffer.
     """
 
-    def __init__(self, function, dim):
+    def __init__(self, function, dim, lastwrite, readby, n):
         self.function = function
         self.dim = dim
+        self.lastwrite = lastwrite
+        self.readby = readby
 
-        self.lastwrite = None
-        self.readby = []
-        self.buffer = None
+        # Determine the buffer size
+        slots = set()
+        for c in [lastwrite] + readby:
+            accesses = c.scope.getreads(function) + c.scope.getwrites(function)
+            slots.update([i[dim] for i in accesses])
+        self.size = size = len(slots)
+
+        # Create the buffer
+        bd = CustomDimension(name='db%d' % n, symbolic_size=size, symbolic_min=0,
+                             symbolic_max=size-1)
+        dimensions = list(function.dimensions)
+        try:
+            self.index = index = function.dimensions.index(dim)
+            dimensions[index] = bd
+        except ValueError:
+            self.index = index = 0
+            dimensions.insert(index, bd)
+        self.buffer = Array(name='%sb' % function.name,
+                            dimensions=dimensions,
+                            dtype=function.dtype,
+                            halo=function.halo)
+
+        # Create the ModuloDimensions through which the buffer is accessed
+        self.mds = [ModuloDimension(dim, i, size, name='d%d' % n)
+                    for n, i in enumerate(slots)]
+
+        # Create lock, to be used to avoid race conditions when
+        # accessing the buffer
+        #TODO
         self.lock = None
+
+    def __repr__(self):
+        return "Buffer[%s,<%s:%s>]" % (self.buffer.name,
+                                       self.buffer.dimensions[self.index],
+                                       ','.join(str(i) for i in self.mds))
 
     @property
     def is_readonly(self):
@@ -187,33 +209,18 @@ class Buffered(object):
         #TODO
         pass
 
+    @property
+    def bdim(self):
+        return self.buffer.dimensions[self.index]
+
     @cached_property
-    def bdindex(self):
+    def mds_mapper(self):
+        return {d.offset: d for d in self.mds}
+
+    def at(self, v, flag=False):
         """
-        The buffer Dimension index within the buffer.
+        Indexify the buffer along the buffer Dimension using `v` as index.
+        If `flag=True`, then indexify the buffered Function.
         """
-        assert self.buffer is not None
-        for n, d in enumerate(self.buffer.dimensions):
-            if d.is_Custom:
-                return n
-        assert False
-
-    @cached_property
-    def mds(self):
-        #TODO: cannot do range(self.size) ... I must check the slots so that
-        # I have -1, 0, 1 ...
-        assert self.buffer is not None
-        return [ModuloDimension(self.dim, i, self.size, name='d%d' % n)
-                for n, i in range(self.size)]
-
-    @cached_property
-    def size(self):
-        assert self.buffer is not None:
-        return self.buffer.shape[self.bdindex]
-
-    def compute_size(self):
-        slots = set()
-        for c in [self.lastwrite] + self.readby:
-            accesses = c.scope.getreads(self.function) + c.scope.getwrites(self.function)
-            slots.update([i[self.dim] for i in accesses])
-        return len(slots)
+        f = self.function if flag else self.buffer
+        return f[indices]
