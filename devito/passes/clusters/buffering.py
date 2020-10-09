@@ -5,6 +5,7 @@ from cached_property import cached_property
 from devito.ir.equations import DummyEq, LoweredEq, lower_exprs
 from devito.ir.clusters import Queue, clusterize
 from devito.ir.support import SEQUENTIAL, Scope
+from devito.symbolics import uxreplace
 from devito.tools import DefaultOrderedDict, filter_ordered, flatten, timed_pass
 from devito.types import Array, CustomDimension, Eq, ModuloDimension
 
@@ -105,10 +106,27 @@ class Buffering(Queue):
             indices[b.index] = b.bdim
             eq = Eq(b.buffer[indices], b.function[indices])
             exprs.append(LoweredEq(lower_exprs(eq)))
-        processed = list(clusterize(exprs)) + clusters
+        processed = list(clusterize(exprs))
+
+        # Make up the substitution rules to replace buffered Functions with buffers
+        subs = {}
+        for c in clusters:
+            for f, b in mapper.items():
+                for a in c.scope.getreads(f) + c.scope.getwrites(f):
+                    indices = list(a.indexed.indices)
+                    indices[b.index] = b.mds_mapper[indices[b.index]]
+                    subs[a.indexed] = b.buffer[indices]
 
         # Create Eqs to copy back `bf` into `f`
-        for c, buffereds in mapper.as_lastwrite_mapper().items():
+        lwmapper = mapper.as_lastwrite_mapper()
+        for c in clusters:
+            exprs = [uxreplace(e, subs) for e in c.exprs]
+            processed.append(c.rebuild(exprs=exprs))
+
+            try:
+                buffereds = lwmapper[c]
+            except KeyError:
+                continue
             exprs = []
             for b in buffereds:
                 writes = list(c.scope.writes[b.function])
@@ -123,11 +141,9 @@ class Buffering(Queue):
             sub_iterators = filter_ordered(flatten(b.mds for b in buffereds))
             ispace = c.ispace.augment({d: sub_iterators})
 
-            processed.insert(processed.index(c)+1,
-                             c.rebuild(exprs=exprs, ispace=ispace))
-        from IPython import embed; embed()
+            processed.append(c.rebuild(exprs=exprs, ispace=ispace))
 
-        # Create replacements
+        from IPython import embed; embed()
 
 
 class BufferMapper(OrderedDict):
