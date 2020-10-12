@@ -443,6 +443,9 @@ class IntervalGroup(PartialOrderTuple):
             return super(IntervalGroup, self).index(self[key])
         raise ValueError("Expected Interval or Dimension, got `%s`" % type(key))
 
+    def next(self, d):
+        return self[self.index(d) + 1]
+
     def __getitem__(self, key):
         if is_integer(key):
             return super(IntervalGroup, self).__getitem__(key)
@@ -794,6 +797,9 @@ class IterationSpace(Space):
         sub_iterators = {k: v for k, v in self.sub_iterators.items() if func(k)}
         directions = {k: v for k, v in self.directions.items() if func(k)}
         return IterationSpace(intervals, sub_iterators, directions)
+
+    def next(self, d):
+        return self.intervals.next(d)
 
     def zero(self, d=None):
         intervals = self.intervals.zero(d)
