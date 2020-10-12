@@ -9,7 +9,7 @@ from devito.ir.support import AFFINE, SEQUENTIAL, Scope
 from devito.symbolics import uxreplace
 from devito.tools import DefaultOrderedDict, as_tuple, filter_ordered, flatten, timed_pass
 from devito.types import (Array, CustomDimension, Eq, Lock, WaitLock, WithLock,
-                          ModuloDimension)
+                          WaitThread, SpawnThread, ModuloDimension)
 
 __all__ = ['Buffering']
 
@@ -121,7 +121,7 @@ class Buffering(Queue):
                 continue
 
             exprs = []
-            locks = defaultdict(list)
+            syncs = defaultdict(list)
             for b in buffereds:
                 writes = list(c.scope.writes[b.function])
                 if len(writes) != 1:
@@ -133,8 +133,8 @@ class Buffering(Queue):
                 indices[b.index] = b.mds_mapper[indices[b.index]]
                 exprs.append(DummyEq(write.indexed, b.buffer[indices]))
 
-                # Build up the lock
-                locks[b.dim].append(WithLock(b.lock[indices[b.index]]))
+                # Define the synchronization workflow
+                syncs[b.dim].append(WithLock(b.lock[indices[b.index]]))
 
             # Add in the Buffer's ModuloDimensions and make sure the copy-back
             # occurs in a disjoint iteration space
@@ -142,7 +142,7 @@ class Buffering(Queue):
             ispace = c.ispace.augment({d: sub_iterators})
             ispace = ispace.lift(ispace.next(d).dim)
 
-            processed.append(c.rebuild(exprs=exprs, ispace=ispace, locks=locks))
+            processed.append(c.rebuild(exprs=exprs, ispace=ispace, syncs=syncs))
 
         return processed
 
