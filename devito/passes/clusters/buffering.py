@@ -7,7 +7,7 @@ from devito.ir.clusters import Queue, clusterize
 from devito.ir.support import SEQUENTIAL, Scope
 from devito.symbolics import uxreplace
 from devito.tools import DefaultOrderedDict, filter_ordered, flatten, timed_pass
-from devito.types import Array, CustomDimension, Eq, ModuloDimension
+from devito.types import Array, CustomDimension, Eq, Lock, ModuloDimension
 
 __all__ = ['Buffering']
 
@@ -206,10 +206,8 @@ class Buffer(object):
         self.mds = [ModuloDimension(dim, i, size, name='d%d' % n)
                     for n, i in enumerate(slots)]
 
-        # Create lock, to be used to avoid race conditions when
-        # accessing the buffer
-        #TODO
-        self.lock = None
+        # Create a lock to avoid race conditions when accessing the buffer
+        self.lock = Lock(name='lock%d' % n, dimensions=bd)
 
     def __repr__(self):
         return "Buffer[%s,<%s:%s>]" % (self.buffer.name,
