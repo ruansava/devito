@@ -9,7 +9,7 @@ from devito.ir.support import AFFINE, SEQUENTIAL, Scope
 from devito.symbolics import uxreplace
 from devito.tools import DefaultOrderedDict, as_tuple, filter_ordered, flatten, timed_pass
 from devito.types import (Array, CustomDimension, Eq, Lock, WaitLock, WithLock,
-                          WaitThread, SpawnThread, ModuloDimension)
+                          WaitThread, SpawnThread, STDThread, ModuloDimension)
 
 __all__ = ['Buffering']
 
@@ -121,7 +121,6 @@ class Buffering(Queue):
                 continue
 
             exprs = []
-            syncs = defaultdict(list)
             for b in buffereds:
                 writes = list(c.scope.writes[b.function])
                 if len(writes) != 1:
@@ -133,7 +132,15 @@ class Buffering(Queue):
                 indices[b.index] = b.mds_mapper[indices[b.index]]
                 exprs.append(DummyEq(write.indexed, b.buffer[indices]))
 
-                # Define the synchronization workflow
+
+            # Create a thread to perform buffer-related operations (e.g., initialization,
+            # copy-back, etc.) asynchronously w.r.t. the main execution flow
+            #TODO
+            #TODO: replace WithThread with AcquireLock and ReleaseLock
+            thread = STDThread(name='thread%d' % n)
+            syncs = defaultdict(list)
+            for b in buffereds:
+                from IPython import embed; embed()
                 syncs[b.dim].append(WithLock(b.lock[indices[b.index]]))
 
             # Add in the Buffer's ModuloDimensions and make sure the copy-back
@@ -205,7 +212,8 @@ class Buffer(object):
         self.mds = [ModuloDimension(dim, i, size, name='d%d' % n)
                     for n, i in enumerate(slots)]
 
-        # Create a lock to avoid race conditions when accessing the buffer
+        # Create a lock to avoid race conditions should the buffer be accessed
+        # in read and write mode by two e.g. two different threads
         self.lock = Lock(name='lock%d' % n, dimensions=bd)
 
     def __repr__(self):
