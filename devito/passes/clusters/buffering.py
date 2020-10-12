@@ -230,11 +230,3 @@ class Buffer(object):
     @cached_property
     def mds_mapper(self):
         return {d.offset: d for d in self.mds}
-
-    def at(self, v, flag=False):
-        """
-        Indexify the buffer along the buffer Dimension using `v` as index.
-        If `flag=True`, then indexify the buffered Function.
-        """
-        f = self.function if flag else self.buffer
-        return f[indices]
