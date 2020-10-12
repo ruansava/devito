@@ -3,11 +3,11 @@ from collections import OrderedDict
 from anytree import findall
 
 from devito.ir.stree.tree import (ScheduleTree, NodeIteration, NodeConditional,
-                                  NodeExprs, NodeSection, NodeHalo, insert)
+                                  NodeSync, NodeExprs, NodeSection, NodeHalo, insert)
 from devito.ir.support import SEQUENTIAL, IterationSpace
 from devito.mpi import HaloScheme, HaloSchemeException
 from devito.parameters import configuration
-from devito.tools import flatten
+from devito.tools import as_tuple, flatten
 
 __all__ = ['stree_build']
 
@@ -76,6 +76,13 @@ def stree_schedule(clusters):
                 node.parent = v
                 # Drop nested guarded sub-trees
                 drop_guarded = True
+
+        # Add in Synchronization operations
+        for k, v in mapper.items():
+            if k.dim in c.syncs:
+                node = NodeSync(c.syncs[k.dim])
+                v.last.parent = node
+                node.parent = v
 
     return stree
 
