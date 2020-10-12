@@ -136,9 +136,11 @@ class Buffering(Queue):
                 # Build up the lock
                 locks[b.dim].append(WithLock(b.lock[indices[b.index]]))
 
-            # Add in the Buffer's ModuloDimensions
+            # Add in the Buffer's ModuloDimensions and make sure the copy-back
+            # occurs in a disjoint iteration space
             sub_iterators = filter_ordered(flatten(b.mds for b in buffereds))
             ispace = c.ispace.augment({d: sub_iterators})
+            ispace = ispace.lift(ispace.next(d).dim)
 
             processed.append(c.rebuild(exprs=exprs, ispace=ispace, locks=locks))
 
