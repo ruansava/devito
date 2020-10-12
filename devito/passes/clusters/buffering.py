@@ -1,12 +1,13 @@
 from collections import OrderedDict
+from itertools import chain
 
 from cached_property import cached_property
 
 from devito.ir.equations import DummyEq, LoweredEq, lower_exprs
 from devito.ir.clusters import Queue, clusterize
-from devito.ir.support import SEQUENTIAL, Scope
+from devito.ir.support import AFFINE, SEQUENTIAL, Scope
 from devito.symbolics import uxreplace
-from devito.tools import DefaultOrderedDict, filter_ordered, flatten, timed_pass
+from devito.tools import DefaultOrderedDict, as_tuple, filter_ordered, flatten, timed_pass
 from devito.types import Array, CustomDimension, Eq, Lock, ModuloDimension
 
 __all__ = ['Buffering']
@@ -78,24 +79,15 @@ class Buffering(Queue):
 
         d = prefix[-1].dim
 
-        if not all(SEQUENTIAL in c.properties[d] for c in clusters):
+        if not all(c.properties[d] >= {SEQUENTIAL, AFFINE} for c in clusters):
             return clusters
 
         # Locate and classify all buffered Function accesses within the `clusters`
-        lastwrite = DefaultOrderedDict(lambda: None)
-        readby = DefaultOrderedDict(list)
-        for c in clusters:
-            for f in c.scope.writes:
-                if self.key(f):
-                    lastwrite[f] = c
-            for f in c.scope.reads:
-                if self.key(f):
-                    readby[f].append(c)
+        accessmap = AccessMap(clusters, self.key)
 
         # Create the buffers
-        functions = filter_ordered(list(lastwrite) + list(readby))
-        mapper = BufferMapper([(f, Buffer(f, d, lastwrite[f], readby[f], n))
-                               for n, f in enumerate(functions)])
+        mapper = BufferMapper([(f, Buffer(f, d, accessmap[f], n))
+                               for n, f in enumerate(accessmap.functions)])
 
         # Create Eqs to initialize `bf` if `f` is a read-write Function
         exprs = []
@@ -108,14 +100,13 @@ class Buffering(Queue):
             exprs.append(LoweredEq(lower_exprs(eq)))
         processed = list(clusterize(exprs))
 
-        # Make up the substitution rules to replace buffered Functions with buffers
+        # Substitution rules to replace buffered Functions with buffers
         subs = {}
-        for c in clusters:
-            for f, b in mapper.items():
-                for a in c.scope.getreads(f) + c.scope.getwrites(f):
-                    indices = list(a.indexed.indices)
-                    indices[b.index] = b.mds_mapper[indices[b.index]]
-                    subs[a.indexed] = b.buffer[indices]
+        for f, b in mapper.items():
+            for a in accessmap[f].accesses:
+                indices = list(a.indexed.indices)
+                indices[b.index] = b.mds_mapper[indices[b.index]]
+                subs[a.indexed] = b.buffer[indices]
 
         # Create Eqs to copy back `bf` into `f`
         lwmapper = mapper.as_lastwrite_mapper()
@@ -143,8 +134,6 @@ class Buffering(Queue):
 
             processed.append(c.rebuild(exprs=exprs, ispace=ispace))
 
-        from IPython import embed; embed()
-
 
 class BufferMapper(OrderedDict):
 
@@ -166,26 +155,24 @@ class Buffer(object):
         The object for which a buffer is created.
     dim : Dimension
         The Dimension along which the buffer is created.
-    lastwrite : Cluster
-        The last Cluster (in program order) performing a write to `function`.
-    readby : list of Cluster
-        All Clusters reading `function`.
+    accessv : AccessV
+        All accesses involving `function`.
     n : int
         A unique identifier for this Buffer.
     """
 
-    def __init__(self, function, dim, lastwrite, readby, n):
+    def __init__(self, function, dim, accessv, n):
         self.function = function
         self.dim = dim
-        self.lastwrite = lastwrite
-        self.readby = readby
+        self.accessv = accessv
 
         # Determine the buffer size
-        slots = set()
-        for c in [lastwrite] + readby:
-            accesses = c.scope.getreads(function) + c.scope.getwrites(function)
-            slots.update([i[dim] for i in accesses])
-        self.size = size = len(slots)
+        slots = {i[dim] for i in accessv.accesses}
+        try:
+            self.size = size = max(slots) - min(slots) + 1
+        except TypeError:
+            assert dim not in function.dimensions
+            self.size = size = 1
 
         # Create the buffer
         bd = CustomDimension(name='db%d' % n, symbolic_size=size, symbolic_min=0,
@@ -215,13 +202,12 @@ class Buffer(object):
                                        ','.join(str(i) for i in self.mds))
 
     @property
-    def is_readonly(self):
-        return self.lastwrite is None
+    def lastwrite(self):
+        return self.accessv.lastwrite
 
     @property
-    def is_readwrite(self):
-        #TODO
-        pass
+    def is_readonly(self):
+        return self.lastwrite is None
 
     @property
     def bdim(self):
@@ -230,3 +216,58 @@ class Buffer(object):
     @cached_property
     def mds_mapper(self):
         return {d.offset: d for d in self.mds}
+
+
+class AccessV(object):
+
+    """
+    A simple data structure capturing the accesses performed by a given Function.
+
+    Parameters
+    ----------
+    function : Function
+        The target Function.
+    readby : list of Cluster
+        All Clusters accessing `function` in read mode.
+    writtenby : list of Cluster
+        All Clusters accessing `function` in write mode.
+    """
+
+    def __init__(self, function, readby, writtenby):
+        self.function = function
+        self.readby = as_tuple(readby)
+        self.writtenby = as_tuple(writtenby)
+
+    @cached_property
+    def allclusters(self):
+        return filter_ordered(self.readby + self.writtenby)
+
+    @cached_property
+    def lastwrite(self):
+        try:
+            return self.writtenby[-1]
+        except IndexError:
+            return None
+
+    @cached_property
+    def accesses(self):
+        return tuple(chain(*[c.scope.getreads(self.function) +
+                             c.scope.getwrites(self.function) for c in self.allclusters]))
+
+
+class AccessMap(OrderedDict):
+
+    def __init__(self, clusters, key):
+        writtenby = DefaultOrderedDict(list)
+        readby = DefaultOrderedDict(list)
+        for c in clusters:
+            for f in c.scope.writes:
+                if key(f):
+                    writtenby[f].append(c)
+            for f in c.scope.reads:
+                if key(f):
+                    readby[f].append(c)
+
+        self.functions = functions = filter_ordered(list(writtenby) + list(readby))
+
+        super().__init__([(f, AccessV(f, readby[f], writtenby[f])) for f in functions])
