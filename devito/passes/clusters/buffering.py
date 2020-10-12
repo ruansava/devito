@@ -1,4 +1,4 @@
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from itertools import chain
 
 from cached_property import cached_property
@@ -8,7 +8,8 @@ from devito.ir.clusters import Queue, clusterize
 from devito.ir.support import AFFINE, SEQUENTIAL, Scope
 from devito.symbolics import uxreplace
 from devito.tools import DefaultOrderedDict, as_tuple, filter_ordered, flatten, timed_pass
-from devito.types import Array, CustomDimension, Eq, Lock, ModuloDimension
+from devito.types import (Array, CustomDimension, Eq, Lock, WaitLock, WithLock,
+                          ModuloDimension)
 
 __all__ = ['Buffering']
 
@@ -71,7 +72,7 @@ class Buffering(Queue):
 
     @timed_pass(name='buffering')
     def process(self, clusters):
-        super().process(clusters)
+        return super().process(clusters)
 
     def callback(self, clusters, prefix):
         if not prefix:
@@ -118,21 +119,30 @@ class Buffering(Queue):
                 buffereds = lwmapper[c]
             except KeyError:
                 continue
+
             exprs = []
+            locks = defaultdict(list)
             for b in buffereds:
                 writes = list(c.scope.writes[b.function])
                 if len(writes) != 1:
                     raise NotImplementedError
                 write = writes.pop()
 
+                # Build up the copy-back expression
                 indices = list(write.indexed.indices)
                 indices[b.index] = b.mds_mapper[indices[b.index]]
                 exprs.append(DummyEq(write.indexed, b.buffer[indices]))
 
+                # Build up the lock
+                locks[b.dim].append(WithLock(b.lock[indices[b.index]]))
+
+            # Add in the Buffer's ModuloDimensions
             sub_iterators = filter_ordered(flatten(b.mds for b in buffereds))
             ispace = c.ispace.augment({d: sub_iterators})
 
-            processed.append(c.rebuild(exprs=exprs, ispace=ispace))
+            processed.append(c.rebuild(exprs=exprs, ispace=ispace, locks=locks))
+
+        return processed
 
 
 class BufferMapper(OrderedDict):
