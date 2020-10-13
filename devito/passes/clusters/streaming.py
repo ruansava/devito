@@ -3,8 +3,7 @@ from itertools import chain
 
 from cached_property import cached_property
 
-from devito.ir.equations import LoweredEq, lower_exprs
-from devito.ir.clusters import Queue, Cluster, clusterize
+from devito.ir.clusters import Queue, Cluster
 from devito.ir.support import AFFINE, SEQUENTIAL, Scope
 from devito.symbolics import uxreplace
 from devito.tools import DefaultOrderedDict, as_tuple, filter_ordered, flatten, timed_pass
@@ -95,9 +94,8 @@ class Buffering(Queue):
                 continue
             indices = list(f.dimensions)
             indices[b.index] = b.bdim
-            eq = Eq(b.buffer[indices], b.function[indices])
-            exprs.append(LoweredEq(lower_exprs(eq)))
-        init = list(clusterize(exprs))
+            exprs.append(Eq(b.buffer[indices], b.function[indices]))
+        init = Cluster.from_eqns(*exprs)
 
         # Substitution rules to replace buffered Functions with buffers
         subs = {}
@@ -113,6 +111,7 @@ class Buffering(Queue):
             exprs = [uxreplace(e, subs) for e in c.exprs]
             processed.append(c.rebuild(exprs=exprs))
 
+            exprs = []
             dump = []
             for f, b in mapper.items():
                 # Compulsory copyback <=> in a guard OR last write
@@ -131,18 +130,12 @@ class Buffering(Queue):
                 findices[b.index] = write[b.index]
                 bindices = list(indices)
                 bindices[b.index] = b.mds_mapper[write[b.index]]
-                eq = LoweredEq(lower_exprs(Eq(b.function[findices], b.buffer[bindices])))
-                dump.append(Cluster(eq, eq.ispace, eq.dspace))
-                #TODO: Cluster(....)
-            from IPython import embed; embed()
-            dump = Cluster.from_clusters(*dump)
 
-            # Add in the Buffer's ModuloDimensions and make sure the copy-back
-            # occurs in a disjoint iteration space
-            sub_iterators = filter_ordered(flatten(b.mds for b in buffereds))
-            ispace = dump.ispace.augment({d: sub_iterators})
-            ispace = ispace.lift(ispace.next(d).dim)
-            dump.rebuild(ispace=ispace)
+                exprs.append(Eq(b.function[findices], b.buffer[bindices]))
+
+            # Make sure the copy-back occurs in a different iteration space than `c`'s
+            dump = Cluster.from_clusters(*Cluster.from_eqns(*exprs))
+            dump = dump.rebuild(ispace=dump.ispace.lift(dump.ispace.next(d).dim))
 
             processed.append(dump)
 
@@ -239,7 +232,7 @@ class Buffer(object):
         self.accessv = accessv
 
         # Determine the buffer size
-        slots = {i[dim] for i in accessv.accesses}
+        slots = filter_ordered(i[dim] for i in accessv.accesses)
         try:
             self.size = size = max(slots) - min(slots) + 1
         except TypeError:
