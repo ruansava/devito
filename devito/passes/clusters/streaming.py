@@ -11,26 +11,24 @@ from devito.tools import DefaultOrderedDict, as_tuple, filter_ordered, flatten, 
 from devito.types import (Array, CustomDimension, Eq, Lock, WaitLock, WithLock,
                           WaitThread, SpawnThread, STDThread, ModuloDimension)
 
-__all__ = ['Buffering']
+__all__ = ['Buffering', 'Prefetching']
 
 
 class Buffering(Queue):
 
     """
-    Replace Functions matching a user-provided condition with Arrays. The
-    computation is then performed over such Arrays, while the buffered
-    Functions are only accessed for initialization and finalization.
-
-    The read-only Functions are not buffering candidates.
+    Replace read-write Functions with Arrays. This gives the compiler control
+    over storage layout, data movement (e.g. between host and device), asynchronous
+    execution, etc.
 
     Parameters
     ----------
     key : callable, optional
-        Apply buffering iff `key(function)` gives True.
+        A Function `f` is a buffering candidate only if `key(f)` returns True.
 
     Examples
     --------
-    If we have a Cluster with the following Eq
+    Assume we have a Cluster with the following Eq
 
         Eq(u[time+1, x], u[time, x] + u[time-1, x] + 1)
 
@@ -152,6 +150,24 @@ class Buffering(Queue):
             processed.append(c.rebuild(exprs=exprs, ispace=ispace, syncs=syncs))
 
         return processed
+
+
+class Prefetching(Queue):
+
+    """
+    Prefetch read-only Functions. This boils down to tagging Clusters with
+    prefetch and deletion SyncOps.
+
+    Parameters
+    ----------
+    key : callable, optional
+        A Function `f` is a prefetching candidate only if `key(f)` returns True.
+    """
+
+    pass
+
+
+# Utils
 
 
 class BufferMapper(OrderedDict):
