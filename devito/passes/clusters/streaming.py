@@ -3,23 +3,23 @@ from itertools import chain
 
 from cached_property import cached_property
 
-from devito.ir.equations import DummyEq, LoweredEq, lower_exprs
-from devito.ir.clusters import Queue, clusterize
+from devito.ir.equations import LoweredEq, lower_exprs
+from devito.ir.clusters import Queue, Cluster, clusterize
 from devito.ir.support import AFFINE, SEQUENTIAL, Scope
 from devito.symbolics import uxreplace
 from devito.tools import DefaultOrderedDict, as_tuple, filter_ordered, flatten, timed_pass
-from devito.types import (Array, CustomDimension, Eq, Lock, WaitLock, WithLock,
-                          WaitThread, SpawnThread, STDThread, ModuloDimension)
+from devito.types import (Array, CustomDimension, Eq, Lock, WaitLock, SetLock, UnsetLock,
+                          WaitThread, WithThread, SyncData, DeleteData, STDThread,
+                          ModuloDimension)
 
-__all__ = ['Buffering', 'Prefetching']
+__all__ = ['Buffering', 'Asynchrony', 'Prefetching']
 
 
 class Buffering(Queue):
 
     """
-    Replace read-write Functions with Arrays. This gives the compiler control
-    over storage layout, data movement (e.g. between host and device), asynchronous
-    execution, etc.
+    Replace read-write Functions with Arrays. This gives the compiler more control
+    over storage layout, data movement (e.g. between host and device), etc.
 
     Parameters
     ----------
@@ -38,25 +38,25 @@ class Buffering(Queue):
 
         1. Introduce one Cluster with two Eqs to initialize the buffer, i.e.
 
-            Eq(u_buf[d, x], u[d, x])
-            Eq(u_buf[d-1, x], u[d-1, x])
+            Eq(ub[d, x], u[d, x])
+            Eq(ub[d-1, x], u[d-1, x])
 
            With the ModuloDimension `d` (a sub-iterator along `time`) starting at
            either `time.symbolic_min` (Forward direction) or `time.symbolic_max`
            (Backward direction).
 
-        2. Introduce one Cluster with one Eq to dump the buffer back into `u`
+        2. Introduce one Cluster with one Eq to copy the buffer back into `u`
 
-            Eq(u[time+1, x], u_buf[d+1, x])
+            Eq(u[time+1, x], ub[d+1, x])
 
-        3. Replace all other occurrences of `u` with `u_buf`
+        3. Replace all other occurrences of `u` with `ub`
 
     So eventually we have three Clusters:
 
-        Cluster([Eq(u_buf[d, x], u[d, x]),
-                 Eq(u_buf[d-1, x], u[d-1, x])])
-        Cluster([Eq(u_buf[d+1, x], u[d, x] + u[d-1, x] + 1)])
-        Cluster([Eq(u[time+1, x], u_buf[d+1, x])])
+        Cluster([Eq(ub[d, x], u[d, x]),
+                 Eq(ub[d-1, x], u[d-1, x])])
+        Cluster([Eq(ub[d+1, x], u[d, x] + u[d-1, x] + 1)])
+        Cluster([Eq(u[time+1, x], ub[d+1, x])])
     """
 
     def __init__(self, key=None):
@@ -88,7 +88,7 @@ class Buffering(Queue):
         mapper = BufferMapper([(f, Buffer(f, d, accessmap[f], n))
                                for n, f in enumerate(accessmap.functions)])
 
-        # Create Eqs to initialize `bf` if `f` is a read-write Function
+        # Create Eqs to initialize `bf`
         exprs = []
         for f, b in mapper.items():
             if b.is_readonly:
@@ -97,7 +97,7 @@ class Buffering(Queue):
             indices[b.index] = b.bdim
             eq = Eq(b.buffer[indices], b.function[indices])
             exprs.append(LoweredEq(lower_exprs(eq)))
-        processed = list(clusterize(exprs))
+        init = list(clusterize(exprs))
 
         # Substitution rules to replace buffered Functions with buffers
         subs = {}
@@ -108,48 +108,90 @@ class Buffering(Queue):
                 subs[a.indexed] = b.buffer[indices]
 
         # Create Eqs to copy back `bf` into `f`
-        lwmapper = mapper.as_lastwrite_mapper()
+        processed = []
         for c in clusters:
             exprs = [uxreplace(e, subs) for e in c.exprs]
             processed.append(c.rebuild(exprs=exprs))
 
-            try:
-                buffereds = lwmapper[c]
-            except KeyError:
-                continue
+            dump = []
+            for f, b in mapper.items():
+                # Compulsory copyback <=> in a guard OR last write
+                test0 = c in b.accessv.writtenby and c.guards.get(d, False)
+                test1 = c is b.accessv.lastwrite
+                if not (test0 or test1):
+                    continue
 
-            exprs = []
-            for b in buffereds:
-                writes = list(c.scope.writes[b.function])
+                writes = list(c.scope.writes[f])
                 if len(writes) != 1:
                     raise NotImplementedError
                 write = writes.pop()
 
-                # Build up the copy-back expression
-                indices = list(write.indexed.indices)
-                indices[b.index] = b.mds_mapper[indices[b.index]]
-                exprs.append(DummyEq(write.indexed, b.buffer[indices]))
-
-
-            # Create a thread to perform buffer-related operations (e.g., initialization,
-            # copy-back, etc.) asynchronously w.r.t. the main execution flow
-            #TODO
-            #TODO: replace WithThread with AcquireLock and ReleaseLock
-            thread = STDThread(name='thread%d' % n)
-            syncs = defaultdict(list)
-            for b in buffereds:
-                from IPython import embed; embed()
-                syncs[b.dim].append(WithLock(b.lock[indices[b.index]]))
+                indices = b.function.dimensions
+                findices = list(indices)
+                findices[b.index] = write[b.index]
+                bindices = list(indices)
+                bindices[b.index] = b.mds_mapper[write[b.index]]
+                eq = LoweredEq(lower_exprs(Eq(b.function[findices], b.buffer[bindices])))
+                dump.append(Cluster(eq, eq.ispace, eq.dspace))
+                #TODO: Cluster(....)
+            from IPython import embed; embed()
+            dump = Cluster.from_clusters(*dump)
 
             # Add in the Buffer's ModuloDimensions and make sure the copy-back
             # occurs in a disjoint iteration space
             sub_iterators = filter_ordered(flatten(b.mds for b in buffereds))
-            ispace = c.ispace.augment({d: sub_iterators})
+            ispace = dump.ispace.augment({d: sub_iterators})
             ispace = ispace.lift(ispace.next(d).dim)
+            dump.rebuild(ispace=ispace)
 
-            processed.append(c.rebuild(exprs=exprs, ispace=ispace, syncs=syncs))
+            processed.append(dump)
 
-        return processed
+        return init + processed
+
+
+class Asynchrony(Queue):
+
+    """
+    Create asynchronous Clusters. This boils down to tagging Clusters
+    with suitable SyncOps, such as WaitLock, WithThread, etc.
+
+    Parameters
+    ----------
+    key : callable, optional
+        A Cluster `c` is made asynchronous only if `key(c)` returns True.
+    """
+
+    pass
+
+#    # Create a lock to avoid race conditions should the buffer be accessed
+#    # in read and write mode by two e.g. two different threads
+#    self.lock = Lock(name='lock%d' % n, dimensions=bd)
+
+#    # Construct the sync-data operation
+#    sync_data.append(b.buffer[indices])
+#
+#    # Construct the synchronization operations
+#    thread = STDThread(name='thread%d' % (len(processed) - len(clusters)))
+#    sync_ops = (
+#        [WaitThread(thread)] +
+#        [SetLock(b.lock[indices[b.index]]) for b in buffereds] +
+#        [WithThread(thread)] +
+#        sync_data +
+#        [UnsetLock(b.lock[indices[b.index]]) for b in buffereds] +
+#            SyncData()
+#         ))]
+#    )
+#    sync_ops 
+#   syncs = defaultdict(list)
+#   for b in buffereds:
+#       from IPython import embed; embed()
+#       syncs[b.dim].extend([
+#            WaitThread(thread),
+#            SetLock(b.lock[indices[b.index]]),
+#            WithThread(thread, [
+#                SyncData()
+#            ])
+#        ])
 
 
 class Prefetching(Queue):
@@ -171,18 +213,13 @@ class Prefetching(Queue):
 
 
 class BufferMapper(OrderedDict):
-
-    def as_lastwrite_mapper(self):
-        ret = DefaultOrderedDict(list)
-        for b in self.values():
-            ret[b.lastwrite].append(b)
-        return ret
+    pass
 
 
 class Buffer(object):
 
     """
-    A buffer with useful metadata attached.
+    A buffer with metadata attached.
 
     Parameters
     ----------
@@ -227,10 +264,6 @@ class Buffer(object):
         # Create the ModuloDimensions through which the buffer is accessed
         self.mds = [ModuloDimension(dim, i, size, name='d%d' % n)
                     for n, i in enumerate(slots)]
-
-        # Create a lock to avoid race conditions should the buffer be accessed
-        # in read and write mode by two e.g. two different threads
-        self.lock = Lock(name='lock%d' % n, dimensions=bd)
 
     def __repr__(self):
         return "Buffer[%s,<%s:%s>]" % (self.buffer.name,
