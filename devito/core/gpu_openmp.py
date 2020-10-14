@@ -15,8 +15,9 @@ from devito.logger import warning
 from devito.mpi.distributed import MPICommObject
 from devito.mpi.routines import (CopyBuffer, HaloUpdate, IrecvCall, IsendCall, SendRecv,
                                  MPICallable)
-from devito.passes.clusters import (Buffering, Lift, cire, cse, eliminate_arrays,
-                                    extract_increments, factorize, fuse, optimize_pows)
+from devito.passes.equations import collect_derivatives, buffering
+from devito.passes.clusters import (Lift, cire, cse, eliminate_arrays, extract_increments,
+                                    factorize, fuse, optimize_pows)
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
@@ -405,6 +406,24 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         return kwargs
 
     @classmethod
+    @timed_pass(name='specializing.Expressions')
+    def _specialize_exprs(cls, expressions, **kwargs):
+        options = kwargs['options']
+
+        expressions = collect_derivatives(expressions)
+
+        # Replace host Functions with Arrays, used as device buffers for
+        # streaming-in and -out of data
+        def callback(f):
+            if not is_on_gpu(f, options['gpu-fit']):
+                return [f.time_dim]
+            else:
+                return None
+        expressions = buffering(expressions, callback)
+
+        return expressions
+
+    @classmethod
     @timed_pass(name='specializing.Clusters')
     def _specialize_clusters(cls, clusters, **kwargs):
         options = kwargs['options']
@@ -431,11 +450,6 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         # further optimizations
         clusters = fuse(clusters)
         clusters = eliminate_arrays(clusters)
-
-        # Replace host Functions with Arrays, used as device buffers for
-        # streaming-in and -out of data
-        key = lambda i: not is_on_gpu(i, options['gpu-fit'])
-        clusters = Buffering(key=key).process(clusters)
 
         return clusters
 
