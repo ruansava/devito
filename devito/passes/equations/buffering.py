@@ -5,7 +5,8 @@ from cached_property import cached_property
 from devito.symbolics import retrieve_function_carriers, uxreplace
 from devito.tools import (Bunch, DefaultOrderedDict, as_tuple, filter_ordered, flatten,
                           timed_pass)
-from devito.types import Array, ConditionalDimension, CustomDimension, Eq, ModuloDimension
+from devito.types import (Array, ConditionalDimension, CustomDimension, Eq,
+                          SteppingDimension)
 
 __all__ = ['buffering']
 
@@ -22,19 +23,19 @@ def buffering(expressions, callback=None):
         The expressions to which the pass is applied.
     callback : callable, optional
         A mechanism to express what the buffering candidates are, and what
-        Dimensions, if any, should be replaced by ModuloDimensions, such that
+        Dimensions, if any, should be replaced by SteppingDimensions, such that
         the buffer has a smaller footprint than that of the Function it stems
         from. The callable takes a Function as input and returns either None
         or a list. If the output is None, then the input is not a buffering
         candidate. Otherwise, the output is a buffering candidate and the list
-        contains the Dimensions to be replaced by new ModuloDimensions. If
+        contains the Dimensions to be replaced by new SteppingDimensions. If
         unspecified, by default all DiscreteFunctions are turned into buffers,
         but no Dimension replacement occurs.
 
     Examples
     --------
     Assume `contraction_rules=[time]`, meaning that all Functions defined over
-    `time` should be replaced by a buffer that uses a ModuloDimension in place
+    `time` should be replaced by a buffer that uses a SteppingDimension in place
     of `time` in the same slot.
     Consider the Eq below:
 
@@ -121,7 +122,7 @@ class Buffer(object):
         The object for which a buffer is created.
     contracted_dims : list of Dimension
         The Dimensions in `function` to be contracted, that is to be replaced
-        by ModuloDimensions.
+        by SteppingDimensions.
     accessv : AccessValue
         All accesses involving `function`.
     n : int
@@ -147,10 +148,9 @@ class Buffer(object):
             bd = CustomDimension('db%d' % n, 0, size-1, size)
             contraction_mapper[d] = dims[dims.index(d)] = bd
 
-            # Create the necessary ModuloDimensions for indexing
-            b = len(index_mapper)
-            index_mapper.update({i: ModuloDimension(d, i, size, name="d%d%d" % (n, b+nn))
-                                 for nn, i in enumerate(indices)})
+            # Create the necessary SteppingDimensions for indexing
+            sd = SteppingDimension(name='sb%d' % n, parent=d)
+            index_mapper.update({i: i.xreplace({d: sd}) for i in indices})
 
         self.contraction_mapper = contraction_mapper
         self.index_mapper = index_mapper
