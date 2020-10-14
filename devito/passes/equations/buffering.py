@@ -86,14 +86,14 @@ def _buffering(expressions, callback):
             buffers.append(Buffer(f, dims, accessv, n))
 
     # Create Eqs to initialize `bf`
-    processed = [Eq(b.buffer, b.function.subs(b.contraction_mapper))
+    processed = [Eq(b.indexify(), b.function.subs(b.contraction_mapper))
                  for b in buffers if not b.is_readonly]
 
     # Substitution rules to replace buffered Functions with buffers
     subs = {}
     for b in buffers:
         for a in b.accessv.accesses:
-            subs[a] = b.apply_indices(a.indices)
+            subs[a] = b.indexify(a.indices)
 
     # Create Eqs to copy back `bf` into `f`
     for e in expressions:
@@ -106,7 +106,7 @@ def _buffering(expressions, callback):
             if not (test0 or test1):
                 continue
 
-            processed.append(Eq(e.lhs, b.apply_indices(e.lhs.indices)))
+            processed.append(Eq(e.lhs, b.indexify(e.lhs.indices)))
 
     return processed
 
@@ -145,11 +145,11 @@ class Buffer(object):
             size = max(slots) - min(slots) + 1
 
             # Replace `d` with a suitable CustomDimension
-            bd = CustomDimension('db%d' % n, 0, size-1, size)
+            bd = CustomDimension('db%d' % n, 0, size-1, size, d)
             contraction_mapper[d] = dims[dims.index(d)] = bd
 
             # Create the necessary SteppingDimensions for indexing
-            sd = SteppingDimension(name='sb%d' % n, parent=d)
+            sd = SteppingDimension(name='sb%d' % n, parent=bd)
             index_mapper.update({i: i.xreplace({d: sd}) for i in indices})
 
         self.contraction_mapper = contraction_mapper
@@ -174,14 +174,16 @@ class Buffer(object):
     def is_readonly(self):
         return self.lastwrite is None
 
-    def apply_indices(self, indices):
-        assert len(indices) == len(self.buffer.dimensions)
-        mapper = {}
-        for i, d in zip(indices, self.buffer.dimensions):
-            md = self.index_mapper.get(i)
-            if md is not None:
-                mapper[d] = md
-        return uxreplace(self.buffer, mapper)
+    @cached_property
+    def indexed(self):
+        return self.buffer.indexed
+
+    def indexify(self, indices=None):
+        if indices is None:
+            indices = list(self.buffer.dimensions)
+        else:
+            indices = [self.index_mapper.get(i, i) for i in indices]
+        return self.indexed[indices]
 
 
 class AccessValue(object):
