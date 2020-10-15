@@ -13,7 +13,15 @@ from devito.types import (Array, CustomDimension, Eq, Lock, WaitLock, SetLock, U
 __all__ = ['Tasker', 'Prefetching']
 
 
-class Tasker(Queue):
+class Asynchronous(Queue):
+
+    def __init__(self, key):
+        assert callable(key)
+        self.key = key
+        super().__init__()
+
+
+class Tasker(Asynchronous):
 
     """
     Create asynchronous Clusters, or "tasks".
@@ -28,11 +36,6 @@ class Tasker(Queue):
     From an implementation viewpoint, an asynchronous Cluster is a Cluster
     with attached suitable SyncOps, such as WaitLock, WithThread, etc.
     """
-
-    def __init__(self, key):
-        assert callable(key)
-        self.key = key
-        super().__init__()
 
     @timed_pass(name='tasker')
     def process(self, clusters):
