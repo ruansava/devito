@@ -82,8 +82,13 @@ def _buffering(expressions, callback):
     buffers = []
     for n, (f, accessv) in enumerate(accessmap.items()):
         dims = callback(f)
-        if dims is not None:
-            buffers.append(Buffer(f, dims, accessv, n))
+        if dims is None:
+            # Not a buffer candidate
+            continue
+        if accessv.lastwrite is None:
+            # Read-only Functions cannot be buffering candidates
+            continue
+        buffers.append(Buffer(f, dims, accessv, n))
 
     # Create Eqs to initialize `bf`
     processed = [Eq(b.indexify(), b.function.subs(b.contraction_mapper))
