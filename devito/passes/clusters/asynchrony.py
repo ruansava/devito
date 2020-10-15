@@ -10,7 +10,7 @@ from devito.tools import DefaultOrderedDict, as_tuple, filter_ordered, flatten, 
 from devito.types import (Array, CustomDimension, Eq, Lock, WaitLock, SetLock, UnsetLock,
                           CopyData, DeleteData, ModuloDimension)
 
-__all__ = ['Tasker', 'Prefetching']
+__all__ = ['Tasker', 'Prefetch']
 
 
 class Asynchronous(Queue):
@@ -116,16 +116,38 @@ class Tasker(Asynchronous):
         return processed
 
 
-class Prefetching(Queue):
+class Prefetch(Asynchronous):
 
     """
-    Prefetch read-only Functions. This boils down to tagging Clusters with
-    prefetch and deletion SyncOps.
+    Prefetch read-only Functions along SEQUENTIAL Dimensions.
 
     Parameters
     ----------
     key : callable, optional
-        A Function `f` is a prefetching candidate only if `key(f)` returns True.
+        A Cluster `c` gets prefetching iff `key(c)` returns True.
+
+    Notes
+    -----
+    From an implementation viewpoint, prefetching consists of tagging Clusters
+    with suitable SyncOps.
     """
 
-    pass
+    @timed_pass(name='prefetch')
+    def process(self, clusters):
+        return super().process(clusters)
+
+    def callback(self, clusters, prefix):
+        if not prefix:
+            return clusters
+
+        d = prefix[-1].dim
+
+        processed = []
+        for c in clusters:
+            if not self.key(c) or SEQUENTIAL not in c.properties[d]:
+                processed.append(c)
+                continue
+
+            from IPython import embed; embed()
+
+        return processed

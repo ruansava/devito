@@ -16,7 +16,7 @@ from devito.mpi.distributed import MPICommObject
 from devito.mpi.routines import (CopyBuffer, HaloUpdate, IrecvCall, IsendCall, SendRecv,
                                  MPICallable)
 from devito.passes.equations import collect_derivatives, buffering
-from devito.passes.clusters import (Lift, Tasker, cire, cse, eliminate_arrays,
+from devito.passes.clusters import (Lift, Prefetch, Tasker, cire, cse, eliminate_arrays,
                                     extract_increments, factorize, fuse, optimize_pows)
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
@@ -430,10 +430,11 @@ class DeviceOpenMPNoopOperator(OperatorCore):
         platform = kwargs['platform']
         sregistry = kwargs['sregistry']
 
-        # Introduce asynchronous tasks
+        # Introduce asynchronous operations
         def key(c):
             return any(not is_on_gpu(f, options['gpu-fit']) for f in c.functions)
         clusters = Tasker(key).process(clusters)
+        clusters = Prefetch(key).process(clusters)
 
         # Toposort+Fusion (the former to expose more fusion opportunities)
         clusters = fuse(clusters, toposort=True)
