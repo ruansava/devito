@@ -6,11 +6,12 @@ from cached_property import cached_property
 from devito.ir.clusters import Queue, Cluster
 from devito.ir.support import AFFINE, SEQUENTIAL, Scope
 from devito.symbolics import uxreplace
-from devito.tools import DefaultOrderedDict, as_tuple, filter_ordered, flatten, timed_pass
-from devito.types import (Array, CustomDimension, Eq, Lock, WaitLock, SetLock, UnsetLock,
-                          CopyData, DeleteData, ModuloDimension)
+from devito.tools import (DefaultOrderedDict, as_tuple, filter_ordered, flatten,
+                          timed_pass)
+from devito.types import (Array, CustomDimension, ModuloDimension, Eq,
+                          Lock, WaitLock, WithLock, WaitAndFetch, normalize_syncs)
 
-__all__ = ['Tasker', 'Prefetch']
+__all__ = ['Tasker', 'Stream']
 
 
 class Asynchronous(Queue):
@@ -77,7 +78,7 @@ class Tasker(Asynchronous):
                         # of size 1 for simplicity
                         ld = CustomDimension(name='ld', symbolic_size=1)
                     lock = locks.setdefault(f, Lock(name='lock%d' % len(locks),
-                                                    dimensions=ld))
+                                                    dimensions=ld, target=f))
 
                     for w in writes:
                         try:
@@ -93,10 +94,9 @@ class Tasker(Asynchronous):
 
                         waits[c1].append(WaitLock(lock[index]))
                         protected[f].add(logical_index)
+                        from IPython import embed; embed()
 
             # Taskify `c0`
-            acquired = []
-            copyrelease = []
             for f in protected:
                 lock = locks[f]
 
@@ -106,33 +106,26 @@ class Tasker(Asynchronous):
                     assert lock.size == 1
                     indices = [0]
 
-                acquired.extend([SetLock(lock[i]) for i in indices])
-                copyrelease.extend([CopyData(f, {d: i}) for i in indices])
-                copyrelease.extend([UnsetLock(lock[i]) for i in indices])
-            tasks[c0] = acquired + copyrelease
+                tasks[c0].extend(WithLock(lock[i]) for i in indices)
 
         processed = [c.rebuild(syncs={d: waits[c] + tasks[c]}) for c in clusters]
 
         return processed
 
 
-class Prefetch(Asynchronous):
+class Stream(Asynchronous):
 
     """
-    Prefetch read-only Functions along SEQUENTIAL Dimensions.
+    Tag Clusters with the WaitAndFetch SyncOp to stream Functions in and out
+    the process memory.
 
     Parameters
     ----------
     key : callable, optional
-        A Cluster `c` gets prefetching iff `key(c)` returns True.
-
-    Notes
-    -----
-    From an implementation viewpoint, prefetching consists of tagging Clusters
-    with suitable SyncOps.
+        A Cluster `c` gets streamed only if `key(c)` returns True.
     """
 
-    @timed_pass(name='prefetch')
+    @timed_pass(name='stream')
     def process(self, clusters):
         return super().process(clusters)
 
@@ -142,12 +135,32 @@ class Prefetch(Asynchronous):
 
         d = prefix[-1].dim
 
-        processed = []
+        mapper = defaultdict(set)
         for c in clusters:
             if not self.key(c) or SEQUENTIAL not in c.properties[d]:
-                processed.append(c)
                 continue
 
-            from IPython import embed; embed()
+            for f, v in c.scope.reads.items():
+                if not f.is_AbstractFunction:
+                    continue
+                if any(f in c1.scope.writes for c1 in clusters):
+                    # Read-only Functions are the sole streaming candidates
+                    continue
+
+                mapper[f].update({i[d] for i in v})
+
+        processed = []
+        for c in clusters:
+
+            syncs = []
+            for f, v in list(mapper.items()):
+                if f in c.scope.reads:
+                    syncs.append(WaitAndFetch(f, v, {i + 1 for i in v}))
+                    mapper.pop(f)
+
+            if syncs:
+                processed.append(c.rebuild(syncs=normalize_syncs(c.syncs, {d: syncs})))
+            else:
+                processed.append(c)
 
         return processed
