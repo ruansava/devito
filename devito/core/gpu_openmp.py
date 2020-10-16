@@ -2,7 +2,7 @@ from collections import namedtuple
 from functools import partial, singledispatch
 
 import cgen as c
-from sympy import Function
+from sympy import And, Function
 import numpy as np
 
 from devito.core.operator import OperatorCore
@@ -10,9 +10,9 @@ from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
 from devito.ir.iet import (Block, Call, Callable, Conditional, ElementalFunction,
-                           Expression, List, PointerCast, SyncSpot, FindNodes,
-                           FindSymbols, LocalExpression, MapExprStmts,
-                           Transformer, derive_parameters)
+                           Expression, List, PointerCast, SyncSpot, While, FindNodes,
+                           FindSymbols, LocalExpression, MapExprStmts, Transformer,
+                           derive_parameters, make_efunc)
 from devito.ir.support import Forward
 from devito.logger import warning
 from devito.mpi.distributed import MPICommObject
@@ -24,7 +24,7 @@ from devito.passes.clusters import (Lift, Stream, Tasker, cire, cse, eliminate_a
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
-from devito.symbolics import Byref, FieldFromComposite, ccode
+from devito.symbolics import Byref, CondEq, FieldFromComposite, ListInitializer, ccode
 from devito.tools import as_mapper, as_tuple, filter_sorted, timed_pass
 from devito.types import Symbol, STDThread, WaitLock, WithLock, WaitAndFetch
 
@@ -54,6 +54,10 @@ class DeviceOmpizer(Ompizer):
             c.Pragma('omp target enter data map(alloc: %s%s) device(devicenum)' % (i, j)),
         'map-update': lambda i, j:
             c.Pragma('omp target update from(%s%s) device(devicenum)' % (i, j)),
+        'map-update-host': lambda i, j:
+            c.Pragma('omp target update from(%s%s) device(devicenum)' % (i, j)),
+        'map-update-device': lambda i, j:
+            c.Pragma('omp target update to(%s%s) device(devicenum)' % (i, j)),
         'map-release': lambda i, j:
             c.Pragma('omp target exit data map(release: %s%s) device(devicenum)'
                      % (i, j)),
@@ -234,17 +238,71 @@ class DeviceOmpizer(Ompizer):
         iet = Transformer(subs).visit(iet)
 
         # Add initialization and finalization code
-        iet = iet._rebuild(body=tuple(pieces.init) + iet.body + tuple(pieces.finalize))
-        from IPython import embed; embed()
+        init = List(body=pieces.init, footer=c.Line())
+        finalize = List(header=c.Line(), body=pieces.finalize)
+        iet = iet._rebuild(body=(init,) + iet.body + (finalize,))
 
         return iet, {'efuncs': pieces.efuncs, 'includes': ['thread']}
 
     def _make_orchestration_waitlock(self, iet, sync_ops, pieces):
-        from IPython import embed; embed()
+        waitloop = List(
+            header=c.Comment("Wait for `%s` to be copied to the host" %
+                             ",".join(s.target.name for s in sync_ops)),
+            body=While(And(*[CondEq(s.handle, 0) for s in sync_ops])),
+            footer=c.Line()
+        )
+
+        iet = List(body=(waitloop,) + iet.body)
+
         return iet
 
     def _make_orchestration_withlock(self, iet, sync_ops, pieces):
-        from IPython import embed; embed()
+        thread = STDThread(self.sregistry.make_name(prefix='thread'))
+        threadwait = Call(FieldFromComposite('join', thread))
+
+        setlock = []
+        actions = []
+        for s in sync_ops:
+            setlock.append(Expression(DummyEq(s.handle, 0)))
+
+            imask = [s.handle.indices[d] if d in s.lock.dimensions else FULL
+                     for d in s.target.dimensions]
+            actions.append(List(
+                header=self._map_update_host(s.target, imask),
+                body=Expression(DummyEq(s.handle, 1))
+            ))
+
+        # Turn `iet` into an ElementalFunction so that it can be
+        # executed asynchronously by `threadhost`
+        name = self.sregistry.make_name(prefix='copy_device_to_host')
+        body = (List(body=actions, footer=c.Line()),) + iet.body
+        efunc = make_efunc(name, List(body=body))
+        pieces.efuncs.append(efunc)
+
+        # Replace `iet` with a call to `efunc` plus locking
+        iet = List(
+            header=c.Comment("Wait for %s to be available again" % thread),
+            body=[threadwait] + [List(
+                header=c.Line(),
+                body=setlock + [List(
+                    header=[c.Line(), c.Comment("Spawn %s to perform the copy" % thread)],
+                    body=Call('std::thread', efunc.make_call(is_indirect=True),
+                              retobj=thread,)
+                )]
+            )]
+        )
+
+        # Initialize the locks
+        for s in sync_ops:
+            values = np.ones(s.lock.shape, dtype=np.int32).tolist()
+            pieces.init.append(LocalExpression(DummyEq(s.lock, ListInitializer(values))))
+
+        # Final wait before jumping back to Python land
+        pieces.finalize.append(List(
+            header=c.Comment("Wait for completion of %s" % thread),
+            body=threadwait
+        ))
+
         return iet
 
     def _make_orchestration_waitandfetch(self, iet, sync_ops, pieces):
@@ -329,7 +387,7 @@ class DeviceOmpizer(Ompizer):
 
         # Final wait before jumping back to Python land
         pieces.finalize.append(List(
-            header=[c.Line(), c.Comment("Wait for completion of %s" % thread)],
+            header=c.Comment("Wait for completion of %s" % thread),
             body=threadwait
         ))
 
