@@ -108,7 +108,12 @@ class Tasker(Asynchronous):
 
                 tasks[c0].extend(WithLock(lock[i]) for i in indices)
 
-        processed = [c.rebuild(syncs={d: waits[c] + tasks[c]}) for c in clusters]
+        processed = []
+        for c in clusters:
+            if waits[c] or tasks[c]:
+                processed.append(c.rebuild(syncs={d: waits[c] + tasks[c]}))
+            else:
+                processed.append(c)
 
         return processed
 
