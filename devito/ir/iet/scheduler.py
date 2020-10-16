@@ -85,7 +85,11 @@ def _lower_stepping_dims(iet):
         groups = as_mapper(mindices, lambda d: d.modulo)
         for k, v in groups.items():
             mapper = {d.origin: d for d in v}
-            rule = lambda i: i.function.is_TimeFunction and i.function._time_size == k
+
+            def rule(o):
+                return (o.function.is_TimeFunction and o.function._time_size == k or
+                        o.function.is_Array and o.function.symbolic_shape[i.dim] == k)
+
             replacer = lambda i: xreplace_indices(i, mapper, rule)
             iet = XSubs(replacer=replacer).visit(iet)
 
