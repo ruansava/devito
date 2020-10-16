@@ -150,16 +150,13 @@ class Stream(Asynchronous):
 
                 mapper[f].update({i[d] for i in v})
 
-        # Fetch direction depends on `d'`s direction
-        fetch_direction = -1 if direction is Backward else 1
-
         processed = []
         for c in clusters:
 
             syncs = []
             for f, v in list(mapper.items()):
                 if f in c.scope.reads:
-                    syncs.append(WaitAndFetch(f, v, {i + fetch_direction for i in v}))
+                    syncs.append(WaitAndFetch(f, d, direction, v))
                     mapper.pop(f)
 
             if syncs:

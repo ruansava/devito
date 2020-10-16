@@ -1,3 +1,4 @@
+from collections import namedtuple
 from functools import partial, singledispatch
 
 import cgen as c
@@ -8,9 +9,11 @@ from devito.core.operator import OperatorCore
 from devito.data import FULL
 from devito.exceptions import InvalidOperator
 from devito.ir.equations import DummyEq
-from devito.ir.iet import (Block, Call, Callable, ElementalFunction, Expression, List,
-                           FindNodes, FindSymbols, LocalExpression, MapExprStmts,
-                           Transformer)
+from devito.ir.iet import (Block, Call, Callable, Conditional, ElementalFunction,
+                           Expression, List, PointerCast, SyncSpot, FindNodes,
+                           FindSymbols, LocalExpression, MapExprStmts,
+                           Transformer, derive_parameters)
+from devito.ir.support import Forward
 from devito.logger import warning
 from devito.mpi.distributed import MPICommObject
 from devito.mpi.routines import (CopyBuffer, HaloUpdate, IrecvCall, IsendCall, SendRecv,
@@ -21,9 +24,9 @@ from devito.passes.clusters import (Lift, Stream, Tasker, cire, cse, eliminate_a
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
-from devito.symbolics import Byref
-from devito.tools import as_tuple, filter_sorted, timed_pass
-from devito.types import Symbol
+from devito.symbolics import Byref, FieldFromComposite, ccode
+from devito.tools import as_mapper, as_tuple, filter_sorted, timed_pass
+from devito.types import Symbol, STDThread, WaitLock, WithLock, WaitAndFetch
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
@@ -66,6 +69,16 @@ class DeviceOmpizer(Ompizer):
         self.gpu_fit = options['gpu-fit']
 
     @classmethod
+    def _make_sections_from_imask(cls, f, imask):
+        datasize = cls._map_data(f)
+        if imask is None:
+            imask = [FULL]*len(datasize)
+        assert len(imask) == len(datasize)
+        sections = ['[%s:%s]' % ((0, j) if i is FULL else (ccode(i), 1))
+                    for i, j in zip(imask, datasize)]
+        return ''.join(sections)
+
+    @classmethod
     def _map_data(cls, f):
         if f.is_Array:
             return f.symbolic_shape
@@ -73,14 +86,14 @@ class DeviceOmpizer(Ompizer):
             return tuple(f._C_get_field(FULL, d).size for d in f.dimensions)
 
     @classmethod
-    def _map_to(cls, f):
-        return cls.lang['map-enter-to'](f.name, ''.join('[0:%s]' % i
-                                                        for i in cls._map_data(f)))
+    def _map_to(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        return cls.lang['map-enter-to'](f.name, sections)
 
     @classmethod
-    def _map_alloc(cls, f):
-        return cls.lang['map-enter-alloc'](f.name, ''.join('[0:%s]' % i
-                                                           for i in cls._map_data(f)))
+    def _map_alloc(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        return cls.lang['map-enter-alloc'](f.name, sections)
 
     @classmethod
     def _map_present(cls, f):
@@ -92,16 +105,28 @@ class DeviceOmpizer(Ompizer):
                                                       for i in cls._map_data(f)))
 
     @classmethod
+    def _map_update_host(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        return cls.lang['map-update-host'](f.name, sections)
+
+    @classmethod
+    def _map_update_device(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        return cls.lang['map-update-device'](f.name, sections)
+
+    @classmethod
     def _map_release(cls, f):
         return cls.lang['map-release'](f.name, ''.join('[0:%s]' % i
                                                        for i in cls._map_data(f)))
 
     @classmethod
-    def _map_delete(cls, f):
-        return cls.lang['map-exit-delete'](f.name, ''.join('[0:%s]' % i for i in
-                                                           cls._map_data(f)), ' if(1%s)' %
-                                           ''.join(' && (%s != 0)' % i for i in
-                                                   cls._map_data(f)))
+    def _map_delete(cls, f, imask=None):
+        sections = cls._make_sections_from_imask(f, imask)
+        # This ugly condition is to avoid a copy-back when, due to
+        # domain decomposition, the local size of a Function is 0, which
+        # would cause a crash
+        cond = ' if(%s)' % ' && '.join('(%s != 0)' % i for i in cls._map_data(f))
+        return cls.lang['map-exit-delete'](f.name, sections, cond)
 
     @classmethod
     def _map_pointers(cls, f):
@@ -117,7 +142,13 @@ class DeviceOmpizer(Ompizer):
     def _make_partree(self, candidates, nthreads=None):
         """
         Parallelize the `candidates` Iterations attaching suitable OpenMP pragmas
-        for GPU offloading.
+        for parallelism. In particular:
+
+            * All parallel Iterations not *writing* to a host Function, that
+              is a Function `f` such that ``is_on_gpu(f) == False`, are offloaded
+              to the device.
+            * The remaining ones, that is those writing to a host Function,
+              are parallelized on the host.
         """
         assert candidates
         root = candidates[0]
@@ -161,6 +192,148 @@ class DeviceOmpizer(Ompizer):
             return partree
         else:
             return super()._make_nested_partree(partree)
+
+    @iet_pass
+    def make_orchestration(self, iet):
+        """
+        Coordinate host and device parallelism. This pass:
+
+            * Implements smart transfer of data between host and device
+              exploiting the information carried by the IET produced by the
+              previous compilation passes;
+            * Creates asynchrnous tasks, implemented via C++ threads, which
+              are responsible for carrying out the data transfer
+            * Generates lock-based statements to implement synchronization
+              between the main thread and the asynchronous tasks.
+        """
+
+        def key(s):
+            # The SyncOps are to be processed in the following order:
+            # 1) WithLock, 2) WaitLock, 3) WaitAndFetch
+            return {WaitLock: 0, WithLock: 1, WaitAndFetch: 2}[s]
+
+        callbacks = {
+            WaitLock: self._make_orchestration_waitlock,
+            WithLock: self._make_orchestration_withlock,
+            WaitAndFetch: self._make_orchestration_waitandfetch
+        }
+
+        sync_spots = FindNodes(SyncSpot).visit(iet)
+
+        if not sync_spots:
+            return iet, {}
+
+        pieces = namedtuple('Pieces', 'init finalize efuncs')([], [], [])
+
+        subs = {}
+        for n in sync_spots:
+            mapper = as_mapper(n.sync_ops, lambda i: type(i))
+            for _type in sorted(mapper, key=key):
+                subs[n] = callbacks[_type](subs.get(n, n), mapper[_type], pieces)
+
+        iet = Transformer(subs).visit(iet)
+
+        # Add initialization and finalization code
+        iet = iet._rebuild(body=tuple(pieces.init) + iet.body + tuple(pieces.finalize))
+        from IPython import embed; embed()
+
+        return iet, {'efuncs': pieces.efuncs, 'includes': ['thread']}
+
+    def _make_orchestration_waitlock(self, iet, sync_ops, pieces):
+        from IPython import embed; embed()
+        return iet
+
+    def _make_orchestration_withlock(self, iet, sync_ops, pieces):
+        from IPython import embed; embed()
+        return iet
+
+    def _make_orchestration_waitandfetch(self, iet, sync_ops, pieces):
+        thread = STDThread(self.sregistry.make_name(prefix='thread'))
+        threadwait = Call(FieldFromComposite('join', thread))
+
+        fetches = []
+        prefetches = []
+        presents = []
+        deletions = []
+        for s in sync_ops:
+            f = s.function
+            for i in s.fetch:
+                if s.direction is Forward:
+                    fc = i.subs(s.dim, s.dim.symbolic_min)
+                    fc_cond = fc <= s.dim.symbolic_max
+                    pfc = i + 1
+                    pfc_cond = pfc <= s.dim.symbolic_max
+                else:
+                    fc = i.subs(s.dim, s.dim.symbolic_max)
+                    fc_cond = fc >= s.dim.symbolic_min
+                    pfc = i - 1
+                    pfc_cond = pfc >= s.dim.symbolic_min
+
+                # Construct fetch IET
+                imask = [fc if s.dim in d._defines else FULL for d in s.dimensions]
+                fetch = List(header=self._map_to(f, imask))
+                fetches.append(Conditional(fc_cond, fetch))
+
+                # Construct deletion and present clauses
+                deletions.append(self._map_delete(f, imask))
+                presents.append(self._map_present(f, imask))
+
+                # Construct prefetch IET
+                imask = [pfc if s.dim in d._defines else FULL for d in s.dimensions]
+                prefetch = List(header=self._map_to(f, imask))
+                prefetches.append(Conditional(pfc_cond, prefetch))
+
+        functions = [s.function for s in sync_ops]
+        casts = [PointerCast(f) for f in functions]
+
+        # Turn init IET into an efunc
+        name = self.sregistry.make_name(prefix='init_device')
+        body = List(body=casts + fetches)
+        parameters = filter_sorted(functions + derive_parameters(body))
+        efunc = ElementalFunction(name, body, 'void', parameters)
+        pieces.efuncs.append(efunc)
+
+        # Call init IET
+        efunc_call = efunc.make_call(is_indirect=True)
+        pieces.init.append(List(
+            header=c.Comment("Spawn %s to initialize data" % thread),
+            body=Call('std::thread', efunc_call, retobj=thread),
+            footer=c.Line()
+        ))
+
+        # Turn prefetch IET into an efunc
+        name = self.sregistry.make_name(prefix='prefetch_host_to_device')
+        body = List(body=casts + prefetches)
+        parameters = filter_sorted(functions + derive_parameters(body))
+        efunc = ElementalFunction(name, body, 'void', parameters)
+        pieces.efuncs.append(efunc)
+
+        # Call prefetch IET
+        efunc_call = efunc.make_call(is_indirect=True)
+        call = Call('std::thread', efunc_call, retobj=thread)
+
+        # Put together all the new IET pieces
+        iet = List(
+            header=[c.Line(),
+                    c.Comment("Wait for %s to be available again" % thread)],
+            body=[threadwait, List(
+                header=[c.Line()] + presents,
+                body=iet.body + (List(
+                    header=([c.Line()] + deletions +
+                            [c.Line(), c.Comment("Spawn %s to prefetch data" % thread)]),
+                    body=call,
+                    footer=c.Line()
+                ),)
+            )]
+        )
+
+        # Final wait before jumping back to Python land
+        pieces.finalize.append(List(
+            header=[c.Line(), c.Comment("Wait for completion of %s" % thread)],
+            body=threadwait
+        ))
+
+        return iet
 
 
 class DeviceOpenMPDataManager(DataManager):
