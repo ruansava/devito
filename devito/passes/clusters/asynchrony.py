@@ -4,7 +4,7 @@ from itertools import chain
 from cached_property import cached_property
 
 from devito.ir.clusters import Queue, Cluster
-from devito.ir.support import AFFINE, SEQUENTIAL, Scope
+from devito.ir.support import AFFINE, SEQUENTIAL, Backward, Scope
 from devito.symbolics import uxreplace
 from devito.tools import (DefaultOrderedDict, as_tuple, filter_ordered, flatten,
                           timed_pass)
@@ -134,6 +134,7 @@ class Stream(Asynchronous):
             return clusters
 
         d = prefix[-1].dim
+        direction = prefix[-1].direction
 
         mapper = defaultdict(set)
         for c in clusters:
@@ -149,13 +150,16 @@ class Stream(Asynchronous):
 
                 mapper[f].update({i[d] for i in v})
 
+        # Fetch direction depends on `d'`s direction
+        fetch_direction = -1 if direction is Backward else 1
+
         processed = []
         for c in clusters:
 
             syncs = []
             for f, v in list(mapper.items()):
                 if f in c.scope.reads:
-                    syncs.append(WaitAndFetch(f, v, {i + 1 for i in v}))
+                    syncs.append(WaitAndFetch(f, v, {i + fetch_direction for i in v}))
                     mapper.pop(f)
 
             if syncs:
