@@ -55,6 +55,10 @@ class DeviceAccizer(DeviceOmpizer):
             c.Pragma('acc data present(%s%s)' % (i, j)),
         'map-update': lambda i, j:
             c.Pragma('acc exit data copyout(%s%s)' % (i, j)),
+        'map-update-host': lambda i, j:
+	    c.Pragma('acc update self(%s%s)' % (i, j)),
+	'map-update-device': lambda i, j:
+	    c.Pragma('acc update device(%s%s)' % (i, j)),
         'map-release': lambda i, j:
             c.Pragma('acc exit data delete(%s%s)' % (i, j)),
         'map-exit-delete': lambda i, j:
