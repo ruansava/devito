@@ -30,7 +30,8 @@ class Tasker(Asynchronous):
     Parameters
     ----------
     key : callable, optional
-        A Cluster `c` becomes asynchronous iff `key(c)` returns True.
+        A Cluster `c` becomes an asynchronous task only `key(f)` returns True
+        for any of the Functions `f` in `c`.
 
     Notes
     -----
@@ -55,11 +56,11 @@ class Tasker(Asynchronous):
         waits = defaultdict(list)
         tasks = defaultdict(list)
         for c0 in clusters:
-            if not self.key(c0):
-                continue
 
             # Prevent future writes to interfere with a task by waiting on a lock
-            may_require_lock = {i for i in c0.scope.reads if i.is_AbstractFunction}
+            may_require_lock = {i for i in c0.scope.reads
+                                if any(self.key(w) for w in c0.scope.writes)}
+
             protected = defaultdict(set)
             for c1 in clusters:
                 offset = int(clusters.index(c1) <= clusters.index(c0))
@@ -94,7 +95,6 @@ class Tasker(Asynchronous):
 
                         waits[c1].append(WaitLock(lock[index]))
                         protected[f].add(logical_index)
-                        from IPython import embed; embed()
 
             # Taskify `c0`
             for f in protected:
@@ -122,7 +122,7 @@ class Stream(Asynchronous):
     Parameters
     ----------
     key : callable, optional
-        A Cluster `c` gets streamed only if `key(c)` returns True.
+        A Function `f` in a Cluster `c` gets streamed only if `key(f)` returns True.
     """
 
     @timed_pass(name='stream')
@@ -137,11 +137,11 @@ class Stream(Asynchronous):
 
         mapper = defaultdict(set)
         for c in clusters:
-            if not self.key(c) or SEQUENTIAL not in c.properties[d]:
+            if SEQUENTIAL not in c.properties[d]:
                 continue
 
             for f, v in c.scope.reads.items():
-                if not f.is_AbstractFunction:
+                if not self.key(f):
                     continue
                 if any(f in c1.scope.writes for c1 in clusters):
                     # Read-only Functions are the sole streaming candidates

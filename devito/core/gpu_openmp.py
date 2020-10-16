@@ -432,8 +432,7 @@ class DeviceOpenMPNoopOperator(OperatorCore):
 
         # This callback is used to trigger certain passes only on Clusters
         # accessing at least one host Function
-        def key(c):
-            return any(not is_on_gpu(f, options['gpu-fit']) for f in c.functions)
+        key = lambda f: not is_on_gpu(f, options['gpu-fit'])
 
         # Identify asynchronous tasks
         clusters = Tasker(key).process(clusters)
