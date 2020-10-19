@@ -24,7 +24,8 @@ from devito.passes.clusters import (Lift, Stream, Tasker, cire, cse, eliminate_a
 from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
                                ParallelTree, optimize_halospots, mpiize, hoist_prodders,
                                iet_pass)
-from devito.symbolics import Byref, CondEq, FieldFromComposite, ListInitializer, ccode
+from devito.symbolics import (Byref, CondEq, DefFunction, FieldFromComposite,
+                              ListInitializer, ccode)
 from devito.tools import as_mapper, as_tuple, filter_sorted, timed_pass
 from devito.types import Symbol, STDThread, WaitLock, WithLock, WaitAndFetch
 
@@ -258,7 +259,10 @@ class DeviceOmpizer(Ompizer):
 
     def _make_orchestration_withlock(self, iet, sync_ops, pieces):
         thread = STDThread(self.sregistry.make_name(prefix='thread'))
-        threadwait = Call(FieldFromComposite('join', thread))
+        threadwait = List(
+            body=Conditional(DefFunction(FieldFromComposite('joinable', thread)),
+                             Call(FieldFromComposite('join', thread)))
+        )
 
         setlock = []
         actions = []
