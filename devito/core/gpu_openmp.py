@@ -338,6 +338,7 @@ class DeviceOmpizer(Ompizer):
                 fetches.append(Conditional(fc_cond, fetch))
 
                 # Construct deletion and present clauses
+                imask = [i if s.dim in d._defines else FULL for d in s.dimensions]
                 deletions.append(self._map_delete(f, imask))
                 presents.append(self._map_present(f, imask))
 
