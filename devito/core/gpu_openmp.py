@@ -269,7 +269,7 @@ class DeviceOmpizer(Ompizer):
         for s in sync_ops:
             setlock.append(Expression(DummyEq(s.handle, 0)))
 
-            imask = [s.handle.indices[d] if d in s.lock.dimensions else FULL
+            imask = [s.handle.indices[d] if d.root in s.lock.locked_dimensions else FULL
                      for d in s.target.dimensions]
             actions.append(List(
                 header=self._map_update_host(s.target, imask),
