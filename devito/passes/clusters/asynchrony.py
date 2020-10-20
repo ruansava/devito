@@ -100,9 +100,10 @@ class Tasker(Asynchronous):
             for f in protected:
                 lock = locks[f]
 
-                try:
-                    indices = sorted({r[d] for r in c0.scope.reads[f]})
-                except TypeError:
+                indices = sorted({r[d] for r in c0.scope.reads[f]})
+                if indices == [None]:
+                    # `lock` is protecting a Function which isn't defined over `d`
+                    # E.g., `d=time` and the protected function is `a(x, y)`
                     assert lock.size == 1
                     indices = [0]
 
