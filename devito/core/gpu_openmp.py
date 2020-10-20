@@ -297,9 +297,10 @@ class DeviceOmpizer(Ompizer):
         )
 
         # Initialize the locks
-        for s in sync_ops:
-            values = np.ones(s.lock.shape, dtype=np.int32).tolist()
-            pieces.init.append(LocalExpression(DummyEq(s.lock, ListInitializer(values))))
+        locks = sorted({s.lock for s in sync_ops}, key=lambda i: i.name)
+        for i in locks:
+            values = np.ones(i.shape, dtype=np.int32).tolist()
+            pieces.init.append(LocalExpression(DummyEq(i, ListInitializer(values))))
 
         # Final wait before jumping back to Python land
         pieces.finalize.append(List(
