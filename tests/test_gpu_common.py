@@ -287,6 +287,34 @@ class TestStreaming(object):
         assert np.all(u.data[0] == 56)
         assert np.all(u.data[1] == 72)
 
+    @pytest.mark.parametrize('opt', [
+        ('fetching', 'orchestrate'),
+        ('buffering', 'fetching', 'orchestrate'),
+    ])
+    def test_fetching_read_write(self, opt):
+        nt = 10
+        grid = Grid(shape=(4, 4))
+
+        u = TimeFunction(name='u', grid=grid, save=nt)
+        u1 = TimeFunction(name='u', grid=grid, save=nt)
+
+        eqn = Eq(u.forward, u + 1)
+
+#        op0 = Operator(eqn, opt='noop')
+        op1 = Operator(eqn, opt=opt)
+        from IPython import embed; embed()
+
+        # Check generated code
+        assert len(retrieve_iteration_tree(op1)) == 2
+        buffers = [i for i in FindSymbols().visit(op1) if i.is_Array]
+        assert len(buffers) == 1
+        assert buffers.pop().symbolic_shape[0] == 2
+
+        op0.apply(time_M=nt-2)
+        op1.apply(time_M=nt-2, u=u1)
+
+        assert np.all(u.data == u1.data)
+
     @pytest.mark.xfail(reason="Need to split WaitAndFetch into finer operations, "
                               "WaitFetch, Delete, and WaitFetchDelete")
     def test_postponed_deletion(self):
@@ -350,8 +378,9 @@ class TestStreaming(object):
         eqns = [Eq(u.forward, u + v + 1),
                 Eq(v.forward, u + v + v.backward)]
 
-        op0 = Operator(eqns, opt='noop')
+        #op0 = Operator(eqns, opt='noop')
         op1 = Operator(eqns, opt=('buffering', 'tasking', 'orchestrate'))
+        from IPython import embed; embed()
 
         # Check generated code
         assert len(retrieve_iteration_tree(op1)) == 5

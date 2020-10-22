@@ -792,10 +792,11 @@ class XSubs(Transformer):
             # after _specialize_iet, it's the only thing we can do
             if s.is_WaitLock or s.is_WithLock:
                 sync_ops.append(s.func(self.replacer(s.handle)))
+            elif s.is_WaitAndFetch or s.is_Delete:
+                sync_ops.append(s.func(s.function, s.dim, self.replacer(s.fetch),
+                                       s.direction))
             else:
-                assert s.is_WaitAndFetch
-                sync_ops.append(s.func(s.function, s.dim, s.direction,
-                                       {self.replacer(i) for i in s.fetch}))
+                assert False
         body = self._visit(o.body)
         return o._rebuild(sync_ops=sync_ops, body=body)
 

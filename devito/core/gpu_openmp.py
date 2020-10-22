@@ -29,7 +29,7 @@ from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
 from devito.symbolics import (Byref, CondEq, DefFunction, FieldFromComposite,
                               ListInitializer, ccode)
 from devito.tools import as_mapper, as_list, as_tuple, filter_sorted, timed_pass
-from devito.types import Symbol, STDThread, WaitLock, WithLock, WaitAndFetch
+from devito.types import Symbol, STDThread, WaitLock, WithLock, WaitAndFetch, Delete
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
@@ -217,12 +217,13 @@ class DeviceOmpizer(Ompizer):
         def key(s):
             # The SyncOps are to be processed in the following order:
             # 1) WithLock, 2) WaitLock, 3) WaitAndFetch
-            return {WaitLock: 0, WithLock: 1, WaitAndFetch: 2}[s]
+            return {WaitLock: 0, WithLock: 1, WaitAndFetch: 2, Delete: 3}[s]
 
         callbacks = {
             WaitLock: self._make_orchestration_waitlock,
             WithLock: self._make_orchestration_withlock,
-            WaitAndFetch: self._make_orchestration_waitandfetch
+            WaitAndFetch: self._make_orchestration_waitandfetch,
+            Delete: self._make_orchestration_delete
         }
 
         sync_spots = FindNodes(SyncSpot).visit(iet)
@@ -322,6 +323,7 @@ class DeviceOmpizer(Ompizer):
         deletions = []
         for s in sync_ops:
             f = s.function
+            from IPython import embed; embed()
             for i in s.fetch:
                 if s.direction is Forward:
                     fc = i.subs(s.dim, s.dim.symbolic_min)
@@ -400,6 +402,30 @@ class DeviceOmpizer(Ompizer):
         ))
 
         return iet
+
+    def _make_orchestration_delete(self, iet, sync_ops, pieces):
+        # Construct deletion clauses
+        deletions = []
+        for s in sync_ops:
+            imask = [s.fetch if s.dim in d._defines else FULL for d in s.dimensions]
+            deletions.append(self._map_delete(f, imask))
+
+        from IPython import embed; embed()
+
+        # Put together all the new IET pieces
+        return List(
+            header=[c.Line(),
+                    c.Comment("Wait for %s to be available again" % thread)],
+            body=[threadwait, List(
+                header=[c.Line()] + presents,
+                body=iet.body + (List(
+                    header=([c.Line()] + deletions +
+                            [c.Line(), c.Comment("Spawn %s to prefetch data" % thread)]),
+                    body=call,
+                    footer=c.Line()
+                ),)
+            )]
+        )
 
 
 class DeviceOpenMPDataManager(DataManager):

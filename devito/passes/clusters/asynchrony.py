@@ -8,8 +8,8 @@ from devito.ir.support import AFFINE, SEQUENTIAL, Backward, Scope
 from devito.symbolics import uxreplace
 from devito.tools import (DefaultOrderedDict, as_tuple, filter_ordered, flatten,
                           is_integer, timed_pass)
-from devito.types import (Array, CustomDimension, ModuloDimension, Eq,
-                          Lock, WaitLock, WithLock, WaitAndFetch, normalize_syncs)
+from devito.types import (Array, CustomDimension, ModuloDimension, Eq, Lock,
+                          WaitLock, WithLock, WaitAndFetch, Delete, normalize_syncs)
 
 __all__ = ['Tasker', 'Fetcher']
 
@@ -148,31 +148,36 @@ class Fetcher(Asynchronous):
         d = prefix[-1].dim
         direction = prefix[-1].direction
 
-        mapper = defaultdict(set)
+        if not all(SEQUENTIAL in c.properties[d] for c in clusters):
+            return clusters
+
+        first_seen = {}
+        last_seen = {}
         for c in clusters:
-            if SEQUENTIAL not in c.properties[d]:
-                continue
+            for i in c.scope.accesses:
+                f = i.function
 
-            for f, v in c.scope.reads.items():
-                if not self.key(f):
-                    continue
-                if any(f in c1.scope.writes for c1 in clusters):
-                    # Read-only Functions are the sole streaming candidates
-                    continue
+                if self.key(f):
+                    k = (f, i[d])
+                    first_seen.setdefault(k, c)
+                    last_seen[k] = c
 
-                mapper[f].update({i[d] for i in v})
+        assert set(first_seen) == set(last_seen)
+
+        if not first_seen:
+            return clusters
+
+        mapper = defaultdict(list)
+        for (f, v), c in first_seen.items():
+            mapper[c].append(WaitAndFetch(f, d, v, direction))
+        for (f, v), c in last_seen.items():
+            mapper[c].append(Delete(f, d, v))
 
         processed = []
         for c in clusters:
-
-            syncs = []
-            for f, v in list(mapper.items()):
-                if f in c.scope.reads:
-                    syncs.append(WaitAndFetch(f, d, direction, v))
-                    mapper.pop(f)
-
-            if syncs:
-                processed.append(c.rebuild(syncs=normalize_syncs(c.syncs, {d: syncs})))
+            v = mapper.get(c)
+            if v is not None:
+                processed.append(c.rebuild(syncs=normalize_syncs(c.syncs, {d: v})))
             else:
                 processed.append(c)
 
