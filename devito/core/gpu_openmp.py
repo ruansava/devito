@@ -29,7 +29,8 @@ from devito.passes.iet import (DataManager, Storage, Ompizer, OpenMPIteration,
 from devito.symbolics import (Byref, CondEq, DefFunction, FieldFromComposite,
                               ListInitializer, ccode)
 from devito.tools import as_mapper, as_list, as_tuple, filter_sorted, timed_pass
-from devito.types import Symbol, STDThread, WaitLock, WithLock, WaitAndFetch, Delete
+from devito.types import (Symbol, STDThread, WaitLock, WithLock, FetchWait,
+                          FetchWaitPrefetch, Delete)
 
 __all__ = ['DeviceOpenMPNoopOperator', 'DeviceOpenMPOperator',
            'DeviceOpenMPCustomOperator']
@@ -81,8 +82,16 @@ class DeviceOmpizer(Ompizer):
         if imask is None:
             imask = [FULL]*len(datasize)
         assert len(imask) == len(datasize)
-        sections = ['[%s:%s]' % ((0, j) if i is FULL else (ccode(i), 1))
-                    for i, j in zip(imask, datasize)]
+        sections = []
+        for i, j in zip(imask, datasize):
+            if i is FULL:
+                start, size = 0, j
+            else:
+                try:
+                    start, size = i
+                except TypeError:
+                    start, size = i, 1
+            sections.append('[%s:%s]' % (start, size))
         return ''.join(sections)
 
     @classmethod
@@ -215,14 +224,14 @@ class DeviceOmpizer(Ompizer):
         """
 
         def key(s):
-            # The SyncOps are to be processed in the following order:
-            # 1) WithLock, 2) WaitLock, 3) WaitAndFetch
-            return {WaitLock: 0, WithLock: 1, Delete: 2, WaitAndFetch: 3}[s]
+            # The SyncOps are to be processed in the following order
+            return [WaitLock, WithLock, Delete, FetchWait, FetchWaitPrefetch].index(s)
 
         callbacks = {
             WaitLock: self._make_orchestration_waitlock,
             WithLock: self._make_orchestration_withlock,
-            WaitAndFetch: self._make_orchestration_waitandfetch,
+            FetchWait: self._make_orchestration_fetchwait,
+            FetchWaitPrefetch: self._make_orchestration_fetchwaitprefetch,
             Delete: self._make_orchestration_delete
         }
 
@@ -313,7 +322,21 @@ class DeviceOmpizer(Ompizer):
 
         return iet
 
-    def _make_orchestration_waitandfetch(self, iet, sync_ops, pieces):
+    def _make_orchestration_fetchwait(self, iet, sync_ops, pieces):
+        # Construct fetches
+        fetches = []
+        for s in sync_ops:
+            fc = s.fetch.subs(s.dim, s.dim.symbolic_min)
+            imask = [(fc, s.step) if s.dim in d._defines else FULL for d in s.dimensions]
+            fetches.append(self._map_to(s.function, imask))
+
+        # Glue together the new IET pieces
+        iet = List(header=fetches, body=iet)
+        from IPython import embed; embed()
+
+        return iet
+
+    def _make_orchestration_fetchwaitprefetch(self, iet, sync_ops, pieces):
         thread = STDThread(self.sregistry.make_name(prefix='thread'))
         threadwait = Call(FieldFromComposite('join', thread))
 

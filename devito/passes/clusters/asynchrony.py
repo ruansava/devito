@@ -9,7 +9,8 @@ from devito.symbolics import uxreplace
 from devito.tools import (DefaultOrderedDict, as_tuple, filter_ordered, flatten,
                           is_integer, timed_pass)
 from devito.types import (Array, CustomDimension, ModuloDimension, Eq, Lock,
-                          WaitLock, WithLock, WaitAndFetch, Delete, normalize_syncs)
+                          WaitLock, WithLock, FetchWait, FetchWaitPrefetch, Delete,
+                          normalize_syncs)
 
 __all__ = ['Tasker', 'Streaming']
 
@@ -129,8 +130,8 @@ class Tasker(Asynchronous):
 class Streaming(Asynchronous):
 
     """
-    Tag Clusters with the WaitAndFetch and Delete SyncOps to stream Functions in
-    and out the process memory.
+    Tag Clusters with the FetchWait, FetchWaitPrefetch and Delete SyncOps to
+    stream Functions in and out the process memory.
 
     Parameters
     ----------
@@ -146,10 +147,23 @@ class Streaming(Asynchronous):
         if not prefix:
             return clusters
 
-        d = prefix[-1].dim
-        direction = prefix[-1].direction
+        it = prefix[-1]
+        d = it.dim
+        direction = it.direction
 
-        if not all(SEQUENTIAL in c.properties[d] for c in clusters):
+        # What are the stream-able Dimensions?
+        # 0) all sequential Dimensions
+        # 1) all CustomDimensions of fixed (i.e. integer) size, which
+        #    implies a bound on the amount of streamed data
+
+        if all(SEQUENTIAL in c.properties[d] for c in clusters):
+            make_fetch = lambda f, v: FetchWaitPrefetch(f, d, v, 1, direction)
+            make_delete = lambda f, v: Delete(f, d, v, 1)
+        elif d.is_Custom and is_integer(it.size):
+            #TODO : not d, but rather then one before or the DummyDimension
+            make_fetch = lambda f, v: FetchWait(f, d, v, it.size, direction)
+            make_delete = lambda f, v: Delete(f, d, v, it.size)
+        else:
             return clusters
 
         first_seen = {}
@@ -170,9 +184,9 @@ class Streaming(Asynchronous):
 
         mapper = defaultdict(list)
         for (f, v), c in first_seen.items():
-            mapper[c].append(WaitAndFetch(f, d, v, direction))
+            mapper[c].append(make_fetch(f, v))
         for (f, v), c in last_seen.items():
-            mapper[c].append(Delete(f, d, v))
+            mapper[c].append(make_delete(f, v))
 
         processed = []
         for c in clusters:
@@ -182,5 +196,4 @@ class Streaming(Asynchronous):
             else:
                 processed.append(c)
 
-        from IPython import embed; embed()
         return processed
