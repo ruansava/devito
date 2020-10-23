@@ -155,14 +155,17 @@ class Streaming(Asynchronous):
         # 0) all sequential Dimensions
         # 1) all CustomDimensions of fixed (i.e. integer) size, which
         #    implies a bound on the amount of streamed data
-
         if all(SEQUENTIAL in c.properties[d] for c in clusters):
             make_fetch = lambda f, v: FetchWaitPrefetch(f, d, v, 1, direction)
             make_delete = lambda f, v: Delete(f, d, v, 1)
+            syncd = d
         elif d.is_Custom and is_integer(it.size):
-            #TODO : not d, but rather then one before or the DummyDimension
             make_fetch = lambda f, v: FetchWait(f, d, v, it.size, direction)
             make_delete = lambda f, v: Delete(f, d, v, it.size)
+            try:
+                syncd = prefix[-2]
+            except IndexError:
+                syncd = None
         else:
             return clusters
 
@@ -192,7 +195,7 @@ class Streaming(Asynchronous):
         for c in clusters:
             v = mapper.get(c)
             if v is not None:
-                processed.append(c.rebuild(syncs=normalize_syncs(c.syncs, {d: v})))
+                processed.append(c.rebuild(syncs=normalize_syncs(c.syncs, {syncd: v})))
             else:
                 processed.append(c)
 

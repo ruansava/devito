@@ -66,6 +66,7 @@ def stree_schedule(clusters):
         NodeExprs(c.exprs, c.ispace, c.dspace, c.ops, c.traffic, root)
 
         # Add in Conditionals and Syncs, which chop down the reuse tree
+        #TODO: SOMEHOW CAPTURE NONE HERE... from STREAMING....
         drop = None
         for k, v in list(mapper.items()):
             if drop:
