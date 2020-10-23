@@ -19,8 +19,8 @@ from devito.types.constant import Constant
 from devito.types.dimension import CustomDimension
 
 __all__ = ['NThreads', 'NThreadsNested', 'NThreadsNonaffine', 'NThreadsMixin',
-           'ThreadID', 'Lock', 'WaitLock', 'WithLock', 'WaitAndFetch', 'Delete',
-           'STDThread', 'normalize_syncs']
+           'ThreadID', 'Lock', 'WaitLock', 'WithLock', 'FetchWait', 'FetchWaitPrefetch',
+           'Delete', 'STDThread', 'normalize_syncs']
 
 
 class NThreadsMixin(object):
@@ -129,9 +129,13 @@ class Lock(Array):
 
 class SyncOp(sympy.Expr, Pickable):
 
+    is_SyncLock = False
+    is_SyncData = False
+
     is_WaitLock = False
     is_WithLock = False
-    is_WaitAndFetch = False
+    is_FetchWait = False
+    is_FetchWaitPrefetch = False
     is_Delete = False
 
     def __new__(cls, handle):
@@ -156,6 +160,8 @@ class SyncOp(sympy.Expr, Pickable):
 
 class SyncLock(SyncOp):
 
+    is_SyncLock = True
+
     @property
     def lock(self):
         return self.handle.function
@@ -167,17 +173,20 @@ class SyncLock(SyncOp):
 
 class SyncData(SyncOp):
 
-    def __new__(cls, function, dim, fetch, direction=None):
-        obj = sympy.Expr.__new__(cls, function, dim, fetch, direction)
+    is_SyncData = True
+
+    def __new__(cls, function, dim, fetch, step, direction=None):
+        obj = sympy.Expr.__new__(cls, function, dim, fetch, step, direction)
         obj.function = function
         obj.dim = dim
         obj.fetch = fetch
+        obj.step = step
         obj.direction = direction
         return obj
 
     def __str__(self):
-        return "%s<%s:%s:%s>" % (self.__class__.__name__, self.function, self.dim,
-                                 self.fetch)
+        return "%s<%s:%s:%s:%d>" % (self.__class__.__name__, self.function,
+                                    self.dim, self.fetch, self.step)
 
     __repr__ = __str__
 
@@ -188,7 +197,7 @@ class SyncData(SyncOp):
         return self.function.dimensions
 
     # Pickling support
-    _pickle_args = ['function', 'dim', 'fetch', 'direction']
+    _pickle_args = ['function', 'dim', 'fetch', 'step', 'direction']
     __reduce_ex__ = Pickable.__reduce_ex__
 
 
@@ -200,8 +209,12 @@ class WithLock(SyncLock):
     is_WithLock = True
 
 
-class WaitAndFetch(SyncData):
-    is_WaitAndFetch = True
+class FetchWait(SyncData):
+    is_FetchWait = True
+
+
+class FetchWaitPrefetch(SyncData):
+    is_FetchWaitPrefetch = True
 
 
 class Delete(SyncData):

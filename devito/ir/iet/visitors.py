@@ -790,11 +790,11 @@ class XSubs(Transformer):
             # TODO: this is not the prettiest, but until we find a way to
             # postpone _lower_stepping_dims and _lower_conditional_dims
             # after _specialize_iet, it's the only thing we can do
-            if s.is_WaitLock or s.is_WithLock:
+            if s.is_SyncLock:
                 sync_ops.append(s.func(self.replacer(s.handle)))
-            elif s.is_WaitAndFetch or s.is_Delete:
+            elif s.is_SyncData:
                 sync_ops.append(s.func(s.function, s.dim, self.replacer(s.fetch),
-                                       s.direction))
+                                       s.step, s.direction))
             else:
                 assert False
         body = self._visit(o.body)
