@@ -11,7 +11,7 @@ from devito.tools import (DefaultOrderedDict, as_tuple, filter_ordered, flatten,
 from devito.types import (Array, CustomDimension, ModuloDimension, Eq, Lock,
                           WaitLock, WithLock, WaitAndFetch, Delete, normalize_syncs)
 
-__all__ = ['Tasker', 'Fetcher']
+__all__ = ['Tasker', 'Streaming']
 
 
 class Asynchronous(Queue):
@@ -30,13 +30,12 @@ class Tasker(Asynchronous):
     Parameters
     ----------
     key : callable, optional
-        A Cluster `c` becomes an asynchronous task only `key(f)` returns True
-        for any of the Functions `f` in `c`.
+        A Cluster `c` becomes an asynchronous task only if `key(c)` returns True
 
     Notes
     -----
     From an implementation viewpoint, an asynchronous Cluster is a Cluster
-    with attached suitable SyncOps, such as WaitLock, WithThread, etc.
+    with attached suitable SyncOps, such as WaitLock, WithLock, etc.
     """
 
     @timed_pass(name='tasker')
@@ -56,10 +55,12 @@ class Tasker(Asynchronous):
         waits = defaultdict(list)
         tasks = defaultdict(list)
         for c0 in clusters:
+            if not self.key(c0):
+                # Not a candidate asynchronous task
+                continue
 
             # Prevent future writes to interfere with a task by waiting on a lock
-            may_require_lock = {i for i in c0.scope.reads
-                                if any(self.key(w) for w in c0.scope.writes)}
+            may_require_lock = set(c0.scope.reads)
 
             protected = defaultdict(set)
             for c1 in clusters:
@@ -125,19 +126,19 @@ class Tasker(Asynchronous):
         return processed
 
 
-class Fetcher(Asynchronous):
+class Streaming(Asynchronous):
 
     """
-    Tag Clusters with the WaitAndFetch SyncOp to stream Functions in and out
-    the process memory.
+    Tag Clusters with the WaitAndFetch and Delete SyncOps to stream Functions in
+    and out the process memory.
 
     Parameters
     ----------
     key : callable, optional
-        A Function `f` in a Cluster `c` gets streamed only if `key(f)` returns True.
+        Return the Functions that need to be streamed in a given Cluster.
     """
 
-    @timed_pass(name='stream')
+    @timed_pass(name='streaming')
     def process(self, clusters):
         return super().process(clusters)
 
@@ -154,15 +155,15 @@ class Fetcher(Asynchronous):
         first_seen = {}
         last_seen = {}
         for c in clusters:
+            candidates = self.key(c)
+            if not candidates:
+                continue
             for i in c.scope.accesses:
                 f = i.function
-
-                if self.key(f):
+                if f in candidates:
                     k = (f, i[d])
                     first_seen.setdefault(k, c)
                     last_seen[k] = c
-
-        assert set(first_seen) == set(last_seen)
 
         if not first_seen:
             return clusters
@@ -181,4 +182,5 @@ class Fetcher(Asynchronous):
             else:
                 processed.append(c)
 
+        from IPython import embed; embed()
         return processed
