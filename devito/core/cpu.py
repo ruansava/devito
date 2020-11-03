@@ -153,7 +153,7 @@ class CPU64Operator(CPU64NoopOperator):
 
     @classmethod
     @timed_pass(name='specializing.Expressions')
-    def _specialize_exprs(cls, expressions, **kwargs):
+    def _specialize_dsl(cls, expressions, **kwargs):
         expressions = collect_derivatives(expressions)
 
         return expressions
@@ -326,6 +326,12 @@ ArmOpenMPOperator = CPU64OpenMPOperator
 class CustomOperator(CPU64Operator):
 
     @classmethod
+    def _make_dsl_passes_mapper(cls, **kwargs):
+        return {
+            'collect-derivs': collect_derivatives,
+        }
+
+    @classmethod
     def _make_exprs_passes_mapper(cls, **kwargs):
         options = kwargs['options']
 
@@ -338,7 +344,6 @@ class CustomOperator(CPU64Operator):
                 return None
 
         return {
-            'collect-derivs': collect_derivatives,
             'buffering': lambda i: buffering(i, callback, options)
         }
 
@@ -379,8 +384,10 @@ class CustomOperator(CPU64Operator):
         }
 
     _known_passes = (
+        # DSL
+        'collect-derivs',
         # Expressions
-        'buffering', 'collect-derivs',
+        'buffering',
         # Clusters
         'blocking', 'topofuse', 'fuse', 'factorize', 'cire-sops', 'cse',
         'lift', 'opt-pows'
@@ -403,6 +410,23 @@ class CustomOperator(CPU64Operator):
                     raise InvalidOperator("Unknown pass `%s`" % i)
 
         return super()._build(expressions, **kwargs)
+
+    @classmethod
+    @timed_pass(name='specializing.DSL')
+    def _specialize_dsl(cls, expressions, **kwargs):
+        passes = as_tuple(kwargs['mode'])
+
+        # Fetch passes to be called
+        passes_mapper = cls._make_dsl_passes_mapper(**kwargs)
+
+        # Call passes
+        for i in passes:
+            try:
+                expressions = passes_mapper[i](expressions)
+            except KeyError:
+                pass
+
+        return expressions
 
     @classmethod
     @timed_pass(name='specializing.Expressions')
