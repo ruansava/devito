@@ -44,6 +44,7 @@ class Node(Signer):
     is_Callable = False
     is_Lambda = False
     is_ElementalFunction = False
+    is_ThreadFunction = False
     is_Call = False
     is_List = False
     is_PointerCast = False

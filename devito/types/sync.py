@@ -5,8 +5,10 @@ device offloading, etc.
 
 import os
 from collections import defaultdict
-from ctypes import POINTER, c_void_p
+from ctypes import POINTER, c_int, c_void_p
 
+from cgen import Initializer, Struct, Value
+from cached_property import cached_property
 import numpy as np
 import sympy
 
@@ -14,13 +16,13 @@ from devito.parameters import configuration
 from devito.tools import (Pickable, as_tuple, ctypes_to_cstr, dtype_to_ctype,
                           dtype_to_cstr, filter_ordered)
 from devito.types.array import Array
-from devito.types.basic import LocalObject
+from devito.types.basic import LocalObject, CompositeLocalObject
 from devito.types.constant import Constant
 from devito.types.dimension import CustomDimension
 
 __all__ = ['NThreads', 'NThreadsNested', 'NThreadsNonaffine', 'NThreadsMixin',
            'ThreadID', 'Lock', 'WaitLock', 'WithLock', 'FetchWait', 'FetchWaitPrefetch',
-           'Delete', 'STDThread', 'normalize_syncs']
+           'Delete', 'STDThread', 'STDThreadArray', 'SharedData', 'normalize_syncs']
 
 
 class NThreadsMixin(object):
@@ -87,6 +89,73 @@ class STDThread(LocalObject):
     _pickle_args = ['name']
 
 
+class STDThreadArray(Array):
+
+    def __init_finalize__(self, *args, **kwargs):
+        kwargs['scope'] = 'stack'
+        kwargs['sharing'] = 'shared'
+        super().__init_finalize__(*args, **kwargs)
+
+    def __padding_setup__(self, **kwargs):
+        # Bypass padding which is useless for STDThreadArrays
+        kwargs['padding'] = 0
+        return super().__padding_setup__(**kwargs)
+
+    @classmethod
+    def __indices_setup__(cls, **kwargs):
+        try:
+            return as_tuple(kwargs['dimensions']), as_tuple(kwargs['dimensions'])
+        except KeyError:
+            nthreads = kwargs['nthreads']
+            dim = CustomDimension(name='i', symbolic_size=nthreads)
+            return (dim,), (dim,)
+
+    @classmethod
+    def __dtype_setup__(cls, **kwargs):
+        return STDThread.dtype
+
+    @property
+    def dimension(self):
+        assert len(self.dimensions) == 1
+        return self.dimensions[0]
+
+
+class SharedData(CompositeLocalObject):
+
+    """
+    A struct to share information between one producer and one consumer thread.
+    """
+    
+    _field_alive = 'alive'
+
+    def __init__(self, name, fields):
+        self._fields_user = fields
+
+        pname = "t%s" % name
+
+        pfields = [(i.name, i._C_ctype) for i in fields]
+        pfields.append((self._field_alive, c_int))
+
+        super(SharedData, self).__init__(name, pname, pfields)
+
+    @cached_property
+    def _C_typedecl(self):
+        fields = []
+        for i, j in self.pfields:
+            if i == self._field_alive:
+                fields.append(Initializer(Value('volatile %s' % ctypes_to_cstr(j), i), 1))
+            else:
+                fields.append(Value(ctypes_to_cstr(j), i))
+        return Struct(self.pname, fields)
+
+    @property
+    def fields_user(self):
+        return self._fields_user
+
+    # Pickling support
+    _pickle_args = ['name', 'fields_user']
+
+
 class Lock(Array):
 
     """
@@ -95,7 +164,7 @@ class Lock(Array):
     """
 
     def __init_finalize__(self, *args, **kwargs):
-        self._target = kwargs.pop('target')
+        self._target = kwargs.pop('target', None)
 
         kwargs['scope'] = 'stack'
         kwargs['sharing'] = 'shared'

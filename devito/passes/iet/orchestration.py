@@ -7,14 +7,14 @@ import numpy as np
 from devito.data import FULL
 from devito.ir.equations import DummyEq
 from devito.ir.iet import (Call, Conditional, ElementalFunction, Expression, List,
-                           PointerCast, SyncSpot, While, FindNodes, LocalExpression,
-                           Transformer, derive_parameters, make_efunc)
+                           Iteration, PointerCast, SyncSpot, While, FindNodes,
+                           LocalExpression, Transformer, derive_parameters, make_tfunc)
 from devito.ir.support import Forward
 from devito.passes.iet.engine import iet_pass
-from devito.symbolics import CondEq, DefFunction, FieldFromComposite, ListInitializer
+from devito.symbolics import CondEq, FieldFromComposite, IndexedPointer, ListInitializer
 from devito.tools import as_mapper, as_list, filter_ordered, filter_sorted
-from devito.types import (STDThread, WaitLock, WithLock, FetchWait, FetchWaitPrefetch,
-                          Delete)
+from devito.types import (STDThreadArray, WaitLock, WithLock, FetchWait,
+                          FetchWaitPrefetch, Delete)
 
 __init__ = ['Orchestrator']
 
@@ -44,7 +44,7 @@ class Orchestrator(object):
         """Shortcut for self._Parallelizer."""
         return self._Parallelizer
 
-    def _make_waitlock(self, iet, sync_ops, pieces):
+    def _make_waitlock(self, iet, sync_ops, *args):
         waitloop = List(
             header=c.Comment("Wait for `%s` to be copied to the host" %
                              ",".join(s.target.name for s in sync_ops)),
@@ -56,15 +56,19 @@ class Orchestrator(object):
 
         return iet
 
-    def _make_withlock(self, iet, sync_ops, pieces):
-        thread = STDThread(self.sregistry.make_name(prefix='thread'))
-        pieces.threads.append(thread)
-        queueid = len(pieces.threads)
+    def _make_withlock(self, iet, sync_ops, pieces, root):
+        locks = sorted({s.lock for s in sync_ops}, key=lambda i: i.name)
 
-        threadwait = List(
-            body=Conditional(DefFunction(FieldFromComposite('joinable', thread)),
-                             Call(FieldFromComposite('join', thread)))
-        )
+        # Determine the number of threads requires for `iet` with the given `sync_ops`
+        lock_sizes = {i.size for i in locks}
+        assert len(lock_sizes) == 1
+        nthreads = lock_sizes.pop()
+
+        # The std::thread array
+        threads = STDThreadArray(name=self.sregistry.make_name(prefix='threads'),
+                                 nthreads=nthreads)
+        pieces.threads.append(threads)
+        queueid = sum(i.size for i in pieces.threads)
 
         setlock = []
         actions = []
@@ -75,44 +79,53 @@ class Orchestrator(object):
                      for d in s.target.dimensions]
             actions.append(List(
                 header=self._P._map_update_wait_host(s.target, imask, queueid=queueid),
-                body=Expression(DummyEq(s.handle, 1))
+                body=Expression(DummyEq(s.lock[0], 1)),
+                footer=c.Line()
             ))
 
         # Turn `iet` into an ElementalFunction so that it can be
         # executed asynchronously by `threadhost`
         name = self.sregistry.make_name(prefix='copy_device_to_host')
-        body = (List(body=actions, footer=c.Line()),) + iet.body
-        efunc = make_efunc(name, List(body=body))
-        pieces.efuncs.append(efunc)
+        body = List(body=tuple(actions) + iet.body)
+        tfunc = make_tfunc(name, body, locks, root, self.sregistry)
+        pieces.tfuncs.append(tfunc)
 
-        # Replace `iet` with a call to `efunc` plus locking
-        iet = List(
-            header=c.Comment("Wait for %s to be available again" % thread),
-            body=[threadwait] + [List(
-                header=c.Line(),
-                body=setlock + [List(
-                    header=[c.Line(), c.Comment("Spawn %s to perform the copy" % thread)],
-                    body=Call('std::thread', efunc.make_call(is_indirect=True),
-                              retobj=thread,)
-                )]
-            )]
-        )
+        # Replace `iet` with actions to fire up the `tfunc`
+        #TODO
+        #iet = List(
+        #    header=c.Line(),
+        #    body=setlock + [List(
+        #        header=[c.Line(), c.Comment("Spawn %s to perform the copy" % thread)],
+        #        body=Call('std::thread', efunc.make_call(is_indirect=True),
+        #                  retobj=thread,)
+        #    )]
+        #)
 
         # Initialize the locks
-        locks = sorted({s.lock for s in sync_ops}, key=lambda i: i.name)
         for i in locks:
             values = np.ones(i.shape, dtype=np.int32).tolist()
             pieces.init.append(LocalExpression(DummyEq(i, ListInitializer(values))))
 
+        # Fire up the threads
+        #TODO: Add a.alive = 0
+        from IPython import embed; embed()
+        body = [Expression(DummyEq(FieldFromComposite(sdata._field_alive,
+                                                      IndexedPointer(sdata, threads.dimension)), 0)),
+                Call('std::thread', tfunc.make_call(is_indirect=True),
+                     retobj=threads[threads.dimension])]
+        threadswait = Iteration(body, threads.dimension, threads.size - 1)
+
         # Final wait before jumping back to Python land
+        body = [Call(FieldFromComposite('join', threads[threads.dimension]))]
+        threadswait = Iteration(body, threads.dimension, threads.size - 1)
         pieces.finalize.append(List(
-            header=c.Comment("Wait for completion of %s" % thread),
-            body=threadwait
+            header=c.Comment("Wait for completion of %s" % threads),
+            body=threadswait
         ))
 
         return iet
 
-    def _make_fetchwait(self, iet, sync_ops, pieces):
+    def _make_fetchwait(self, iet, sync_ops, *args):
         # Construct fetches
         fetches = []
         for s in sync_ops:
@@ -125,7 +138,7 @@ class Orchestrator(object):
 
         return iet
 
-    def _make_fetchwaitprefetch(self, iet, sync_ops, pieces):
+    def _make_fetchwaitprefetch(self, iet, sync_ops, pieces, *args):
         thread = STDThread(self.sregistry.make_name(prefix='thread'))
         pieces.threads.append(thread)
         queueid = len(pieces.threads)
@@ -215,7 +228,7 @@ class Orchestrator(object):
 
         return iet
 
-    def _make_delete(self, iet, sync_ops, pieces):
+    def _make_delete(self, iet, sync_ops, *args):
         # Construct deletion clauses
         deletions = []
         for s in sync_ops:
@@ -253,13 +266,13 @@ class Orchestrator(object):
         if not sync_spots:
             return iet, {}
 
-        pieces = namedtuple('Pieces', 'init finalize efuncs threads')([], [], [], [])
+        pieces = namedtuple('Pieces', 'init finalize tfuncs threads')([], [], [], [])
 
         subs = {}
         for n in sync_spots:
             mapper = as_mapper(n.sync_ops, lambda i: type(i))
             for _type in sorted(mapper, key=key):
-                subs[n] = callbacks[_type](subs.get(n, n), mapper[_type], pieces)
+                subs[n] = callbacks[_type](subs.get(n, n), mapper[_type], pieces, iet)
 
         iet = Transformer(subs).visit(iet)
 
@@ -268,4 +281,4 @@ class Orchestrator(object):
         finalize = List(header=c.Line(), body=pieces.finalize)
         iet = iet._rebuild(body=(init,) + iet.body + (finalize,))
 
-        return iet, {'efuncs': pieces.efuncs, 'includes': ['thread']}
+        return iet, {'efuncs': pieces.tfuncs, 'includes': ['thread']}
