@@ -110,7 +110,7 @@ class ThreadFunction(Callable):
         from IPython import embed; embed()
 
 
-def make_tfunc(name, iet, locks, root, sregistry):
+def make_tfunc(name, iet, threads, locks, root, sregistry):
     """
     Automate the creation of ThreadFunctions.
 
@@ -125,11 +125,12 @@ def make_tfunc(name, iet, locks, root, sregistry):
     known += tuple(i for i in required if i.is_Array and i._mem_shared)
     parameters, dynamic_parameters = split(required, lambda i: i in known)
 
-    sdata = SharedData(sregistry.make_name(prefix='sdata'), dynamic_parameters)
+    sdata = SharedData(name=sregistry.make_name(prefix='sdata'),
+                       nthreads=threads.size, fields=dynamic_parameters)
     parameters.append(sdata)
 
     # Prepend the shared data, available upon thread activation
-    iet = List(body=(List(body=[Expression(DummyEq(i, FieldFromPointer(i.name, sdata)))
+    iet = List(body=(List(body=[Expression(DummyEq(i, FieldFromPointer(i.name, sdata[0])))
                                 for i in dynamic_parameters],
                           footer = c.Line()), iet))
 
@@ -138,6 +139,6 @@ def make_tfunc(name, iet, locks, root, sregistry):
     iet = Conditional(And(*[CondEq(i[0], 0) for i in locks]), iet)
 
     # The thread keeps spinning until the alive flag is set to 0 by the main thread
-    iet = While(CondEq(FieldFromPointer(sdata._field_alive, sdata), 1), iet)
+    iet = While(CondEq(FieldFromPointer(sdata._field_alive, sdata[0]), 1), iet)
 
     return ThreadFunction(name, iet, parameters, locks, sdata)

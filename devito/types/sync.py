@@ -16,7 +16,7 @@ from devito.parameters import configuration
 from devito.tools import (Pickable, as_tuple, ctypes_to_cstr, dtype_to_ctype,
                           dtype_to_cstr, filter_ordered)
 from devito.types.array import Array
-from devito.types.basic import LocalObject, CompositeLocalObject
+from devito.types.basic import LocalObject
 from devito.types.constant import Constant
 from devito.types.dimension import CustomDimension
 
@@ -89,7 +89,7 @@ class STDThread(LocalObject):
     _pickle_args = ['name']
 
 
-class STDThreadArray(Array):
+class ThreadArray(Array):
 
     def __init_finalize__(self, *args, **kwargs):
         kwargs['scope'] = 'stack'
@@ -110,33 +110,40 @@ class STDThreadArray(Array):
             dim = CustomDimension(name='i', symbolic_size=nthreads)
             return (dim,), (dim,)
 
-    @classmethod
-    def __dtype_setup__(cls, **kwargs):
-        return STDThread.dtype
-
     @property
     def dimension(self):
         assert len(self.dimensions) == 1
         return self.dimensions[0]
 
 
-class SharedData(CompositeLocalObject):
+class STDThreadArray(ThreadArray):
+
+    @classmethod
+    def __dtype_setup__(cls, **kwargs):
+        return STDThread.dtype
+
+
+class SharedData(ThreadArray):
 
     """
-    A struct to share information between one producer and one consumer thread.
+    An Array of structs, each struct containing data shared by one producer and
+    one consumer thread.
     """
     
     _field_alive = 'alive'
 
-    def __init__(self, name, fields):
-        self._fields_user = fields
+    def __init_finalize__(self, *args, **kwargs):
+        name = kwargs['name']
+        fields = kwargs.pop('fields')
 
-        pname = "t%s" % name
+        self._fields_user = fields
+        self._pname = "t%s" % name
 
         pfields = [(i.name, i._C_ctype) for i in fields]
         pfields.append((self._field_alive, c_int))
+        self._pfields = pfields
 
-        super(SharedData, self).__init__(name, pname, pfields)
+        super(SharedData, self).__init_finalize__(*args, **kwargs)
 
     @cached_property
     def _C_typedecl(self):
@@ -152,8 +159,16 @@ class SharedData(CompositeLocalObject):
     def fields_user(self):
         return self._fields_user
 
+    @property
+    def pname(self):
+        return self._pname
+
+    @property
+    def pfields(self):
+        return self._pfields
+
     # Pickling support
-    _pickle_args = ['name', 'fields_user']
+    _pickle_kwargs = ThreadArray._pickle_kwargs + ['fields_user']
 
 
 class Lock(Array):

@@ -87,7 +87,7 @@ class Orchestrator(object):
         # executed asynchronously by `threadhost`
         name = self.sregistry.make_name(prefix='copy_device_to_host')
         body = List(body=tuple(actions) + iet.body)
-        tfunc = make_tfunc(name, body, locks, root, self.sregistry)
+        tfunc = make_tfunc(name, body, threads, locks, root, self.sregistry)
         pieces.tfuncs.append(tfunc)
 
         # Replace `iet` with actions to fire up the `tfunc`
@@ -108,9 +108,12 @@ class Orchestrator(object):
 
         # Fire up the threads
         #TODO: Add a.alive = 0
+        sdata = tfunc.sdata
+        a = Expression(DummyEq(FieldFromComposite(sdata._field_alive,
+                                                  sdata[threads.dimension]), 0))
         from IPython import embed; embed()
         body = [Expression(DummyEq(FieldFromComposite(sdata._field_alive,
-                                                      IndexedPointer(sdata, threads.dimension)), 0)),
+                                                      sdata[threads.dimension]), 0)),
                 Call('std::thread', tfunc.make_call(is_indirect=True),
                      retobj=threads[threads.dimension])]
         threadswait = Iteration(body, threads.dimension, threads.size - 1)
