@@ -107,24 +107,23 @@ class Orchestrator(object):
             pieces.init.append(LocalExpression(DummyEq(i, ListInitializer(values))))
 
         # Fire up the threads
-        #TODO: Add a.alive = 0
-        sdata = tfunc.sdata
-        a = Expression(DummyEq(FieldFromComposite(sdata._field_alive,
-                                                  sdata[threads.dimension]), 0))
-        from IPython import embed; embed()
-        body = [Expression(DummyEq(FieldFromComposite(sdata._field_alive,
-                                                      sdata[threads.dimension]), 0)),
-                Call('std::thread', tfunc.make_call(is_indirect=True),
-                     retobj=threads[threads.dimension])]
-        threadswait = Iteration(body, threads.dimension, threads.size - 1)
+        #TODO
+        #body = Call('std::thread', tfunc.make_call(is_indirect=True),
+        #            retobj=threads[threads.dimension])
+        #threadsinit = Iteration(body, threads.dimension, threads.size - 1)
+        #pieces.init.append(threadsinit)
 
         # Final wait before jumping back to Python land
-        body = [Call(FieldFromComposite('join', threads[threads.dimension]))]
+        sdata = tfunc.sdata
+        body = [Expression(DummyEq(FieldFromComposite(sdata._field_alive,
+                                                      sdata[threads.dimension]), 0)),
+                Call(FieldFromComposite('join', threads[threads.dimension]))]
         threadswait = Iteration(body, threads.dimension, threads.size - 1)
         pieces.finalize.append(List(
             header=c.Comment("Wait for completion of %s" % threads),
             body=threadswait
         ))
+        from IPython import embed; embed()
 
         return iet
 
