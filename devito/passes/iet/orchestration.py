@@ -83,7 +83,57 @@ class Orchestrator(object):
         iet = While(CondNe(FieldFromPointer(sdata._field_flag, sdata.symbolic_base), 0),
                     iet)
 
-        return Callable(name, iet, 'void', parameters, ('static',)), sdata
+        return Callable(name, iet, 'void', parameters, 'static'), sdata
+
+    def __make_threads(self, value=None):
+        value = value or 1
+        name = self.sregistry.make_name(prefix='threads')
+        nthreads_std = NThreadsSTD(name='%s_std' % name, value=value)
+        threads = STDThreadArray(name=name, nthreads_std=nthreads_std)
+
+        return threads
+
+    def __make_init_threads(self, threads, sdata, tfunc, pieces):
+        d = threads.dim
+
+        idinit = DummyExpr(FieldFromComposite(sdata._field_id, sdata[d]),
+                           1 + sum(i.size for i in pieces.threads) + d)
+        arguments = list(tfunc.parameters)
+        arguments[-1] = sdata.symbolic_base + d
+        call = Call('std::thread', Call(tfunc.name, arguments, is_indirect=True),
+                    retobj=threads[d])
+        threadsinit = Iteration([idinit, call], d, threads.size - 1)
+
+        return threadsinit
+
+    def __make_finalize_threads(self, threads, sdata):
+        d = threads.dim
+
+        body = [DummyExpr(FieldFromComposite(sdata._field_flag, sdata[d]), 0),
+                Call(FieldFromComposite('join', threads[d]))]
+        threadswait = List(
+            header=c.Comment("Wait for completion of %s" % threads.name),
+            body=Iteration(body, d, threads.size - 1)
+        )
+
+        return threadswait
+
+    def __make_activate_thread(self, threads, sdata, sync_ops):
+        d = threads.dim
+        sync_locks = [s for s in sync_ops if s.is_SyncLock]
+
+        condition = Or(*([CondNe(s.handle, 2) for s in sync_locks] +
+                         [CondNe(FieldFromComposite(sdata._field_flag, sdata[d]), 1)]))
+        activation = [DummyExpr(d, 0),
+                      While(condition, DummyExpr(d, (d + 1) % threads.size))]
+        activation.extend([DummyExpr(FieldFromComposite(i.name, sdata[d]), i)
+                           for i in sdata.fields_user])
+        activation.extend([DummyExpr(s.handle, 0) for s in sync_locks])
+        activation.append(DummyExpr(FieldFromComposite(sdata._field_flag, sdata[d]), 2))
+        activation = List(header=[c.Line(), c.Comment("Activate `%s`" % threads.name)],
+                          body=activation, footer=c.Line())
+
+        return activation
 
     def _make_waitlock(self, iet, sync_ops, *args):
         waitloop = List(
@@ -100,10 +150,7 @@ class Orchestrator(object):
     def _make_withlock(self, iet, sync_ops, pieces, root):
         locks = sorted({s.lock for s in sync_ops}, key=lambda i: i.name)
 
-        # The std::thread array
-        name = self.sregistry.make_name(prefix='threads')
-        nthreads_std = NThreadsSTD(name='%s_std' % name, value=min(i.size for i in locks))
-        threads = STDThreadArray(name=name, nthreads_std=nthreads_std)
+        threads = self.__make_threads(value=min(i.size for i in locks))
 
         preactions = []
         postactions = []
@@ -126,19 +173,8 @@ class Orchestrator(object):
         tfunc, sdata = self.__make_tfunc(name, body, root, threads)
         pieces.tfuncs.append(tfunc)
 
-        # Replace `iet` with actions to fire up the `tfunc`
-        actions = []
-        d = threads.dim
-        condition = Or(*([CondNe(s.handle, 2) for s in sync_ops] +
-                         [CondNe(sdata[d], 1)]))
-        activation = [DummyExpr(d, 0),
-                      While(condition, DummyExpr(d, (d + 1) % threads.size))]
-        activation.extend([DummyExpr(FieldFromComposite(i.name, sdata[d]), i)
-                           for i in sdata.fields_user])
-        activation.extend([DummyExpr(s.handle, 0) for s in sync_ops])
-        activation.append(DummyExpr(FieldFromComposite(sdata._field_flag, sdata[d]), 2))
-        iet = List(header=[c.Line(), c.Comment("Activate `%s`" % threads)],
-                   body=activation, footer=c.Line())
+        # Schedule computation to the first available thread
+        iet = self.__make_activate_thread(threads, sdata, sync_ops)
 
         # Initialize the locks
         for i in locks:
@@ -146,24 +182,11 @@ class Orchestrator(object):
             pieces.init.append(LocalExpression(DummyEq(i, ListInitializer(values))))
 
         # Fire up the threads
-        idinit = DummyExpr(FieldFromComposite(sdata._field_id, sdata[d]),
-                           1 + sum(i.size for i in pieces.threads) + d)
-        arguments = list(tfunc.parameters)
-        arguments[-1] = sdata.symbolic_base + d
-        call = Call('std::thread', Call(tfunc.name, arguments, is_indirect=True),
-                    retobj=threads[d])
-        threadsinit = Iteration([idinit, call], d, threads.size - 1)
+        pieces.init.append(self.__make_init_threads(threads, sdata, tfunc, pieces))
         pieces.threads.append(threads)
-        pieces.init.append(threadsinit)
 
         # Final wait before jumping back to Python land
-        body = [DummyExpr(FieldFromComposite(sdata._field_flag, sdata[threads.dim]), 0),
-                Call(FieldFromComposite('join', threads[threads.dim]))]
-        threadswait = Iteration(body, threads.dim, threads.size - 1)
-        pieces.finalize.append(List(
-            header=c.Comment("Wait for completion of %s" % threads),
-            body=threadswait
-        ))
+        pieces.finalize.append(self.__make_finalize_threads(threads, sdata))
 
         return iet
 
@@ -180,19 +203,8 @@ class Orchestrator(object):
 
         return iet
 
-    def _make_fetchwaitprefetch(self, iet, sync_ops, pieces, *args):
-        # The queueid starting point so that different threads logically owns
-        # different streaming queues
-        base = 1 + sum(i.size for i in pieces.threads)
-
-        # The std::thread array
-        threads = STDThreadArray(name=self.sregistry.make_name(prefix='threads'),
-                                 nthreads=nthreads)
-        pieces.threads.append(threads)
-
-        # !!! BELOW: TODO !!!
-
-        threadwait = Call(FieldFromComposite('join', thread))
+    def _make_fetchwaitprefetch(self, iet, sync_ops, pieces, root):
+        threads = self.__make_threads()
 
         fetches = []
         prefetches = []
@@ -212,7 +224,8 @@ class Orchestrator(object):
 
             # Construct fetch IET
             imask = [(fc, s.size) if d.root is s.dim.root else FULL for d in s.dimensions]
-            fetch = List(header=self._P._map_to_wait(s.function, imask, queueid))
+            fetch = List(header=self._P._map_to_wait(s.function, imask,
+                                                     SharedData._field_id))
             fetches.append(Conditional(fc_cond, fetch))
 
             # Construct present clauses
@@ -223,7 +236,8 @@ class Orchestrator(object):
             # Construct prefetch IET
             imask = [(pfc, s.size) if d.root is s.dim.root else FULL
                      for d in s.dimensions]
-            prefetch = List(header=self._P._map_to_wait(s.function, imask, queueid))
+            prefetch = List(header=self._P._map_to_wait(s.function, imask,
+                                                        SharedData._field_id))
             prefetches.append(Conditional(pfc_cond, prefetch))
 
         functions = filter_ordered(s.function for s in sync_ops)
@@ -233,23 +247,17 @@ class Orchestrator(object):
         name = self.sregistry.make_name(prefix='init_device')
         body = List(body=casts + fetches)
         parameters = filter_sorted(functions + derive_parameters(body))
-        efunc = ElementalFunction(name, body, 'void', parameters)
-        pieces.efuncs.append(efunc)
-
-        # Call init IET
-        efunc_call = efunc.make_call(is_indirect=True)
-        pieces.init.append(List(
-            header=c.Comment("Spawn %s to initialize data" % thread),
-            body=Call('std::thread', efunc_call, retobj=thread),
-            footer=c.Line()
-        ))
+        tfunc = Callable(name, body, 'void', parameters, 'static')
+        pieces.tfuncs.append(tfunc)
 
         # Turn prefetch IET into an efunc
         name = self.sregistry.make_name(prefix='prefetch_host_to_device')
         body = List(body=casts + prefetches)
         parameters = filter_sorted(functions + derive_parameters(body))
+        #TODO TRY via __make_tfunc ??
+        from IPython import embed; embed()
         efunc = ElementalFunction(name, body, 'void', parameters)
-        pieces.efuncs.append(efunc)
+        pieces.tfuncs.append(efunc)
 
         # Call prefetch IET
         efunc_call = efunc.make_call(is_indirect=True)
@@ -268,6 +276,10 @@ class Orchestrator(object):
                 ),)
             )]
         )
+
+        # Fire up the threads
+        pieces.init.append(self.__make_init_threads(threads, sdata, tfunc, pieces))
+        pieces.threads.append(threads)
 
         # Final wait before jumping back to Python land
         pieces.finalize.append(List(
