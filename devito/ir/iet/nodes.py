@@ -10,7 +10,7 @@ from collections.abc import Iterable
 import cgen as c
 
 from devito.data import FULL
-from devito.ir.equations import ClusterizedEq
+from devito.ir.equations import ClusterizedEq, DummyEq
 from devito.ir.support import (SEQUENTIAL, PARALLEL, PARALLEL_IF_ATOMIC, VECTORIZED,
                                AFFINE, Property, Forward, detect_io)
 from devito.symbolics import ListInitializer, FunctionFromPointer, as_symbol, ccode
@@ -23,7 +23,8 @@ __all__ = ['Node', 'Block', 'Expression', 'Element', 'Callable', 'Call', 'Condit
            'Iteration', 'List', 'LocalExpression', 'Section', 'TimedList', 'Prodder',
            'MetaCall', 'PointerCast', 'ForeignExpression', 'HaloSpot', 'IterationTree',
            'ExpressionBundle', 'AugmentedExpression', 'Increment', 'Return', 'While',
-           'ParallelIteration', 'ParallelBlock', 'Dereference', 'Lambda', 'SyncSpot']
+           'ParallelIteration', 'ParallelBlock', 'Dereference', 'Lambda', 'SyncSpot',
+           'DummyExpr']
 
 # First-class IET nodes
 
@@ -44,7 +45,6 @@ class Node(Signer):
     is_Callable = False
     is_Lambda = False
     is_ElementalFunction = False
-    is_ThreadFunction = False
     is_Call = False
     is_List = False
     is_PointerCast = False
@@ -271,7 +271,7 @@ class Call(ExprStmt, Node):
     def functions(self):
         retval = tuple(i for i in self.arguments if isinstance(i, AbstractFunction))
         if self.base is not None:
-            retval += (self.base,)
+            retval += (self.base.function,)
         if self.retobj is not None:
             retval += (self.retobj.function,)
         return retval
@@ -842,6 +842,10 @@ class LocalExpression(Expression):
 
     is_LocalExpression = True
 
+    @cached_property
+    def write(self):
+        return self.expr.lhs.function
+
     @property
     def defines(self):
         return (self.write, )
@@ -1044,6 +1048,10 @@ class SyncSpot(List):
 
     def __repr__(self):
         return "<SyncSpot (%s)>" % ",".join(str(i) for i in self.sync_ops)
+
+
+def DummyExpr(*args):
+    return Expression(DummyEq(*args))
 
 
 Return = lambda i='': Element(c.Statement('return%s' % ((' %s' % i) if i else i)))

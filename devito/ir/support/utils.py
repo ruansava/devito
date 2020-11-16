@@ -169,7 +169,7 @@ def detect_io(exprs, relax=False):
             # We only end up here after complex IET transformations which make
             # use of composite types
             assert isinstance(i.lhs, FunctionFromPointer)
-            f = i.lhs.composite.function
+            f = i.lhs.base.function
             if rule(f):
                 writes.append(f)
 

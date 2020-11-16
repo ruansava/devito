@@ -1,18 +1,10 @@
-from ctypes import c_int
-
-import cgen as c
 from cached_property import cached_property
-from sympy import And
 
-from devito.ir.equations import DummyEq
-from devito.ir.iet.nodes import Call, Callable, Conditional, Expression, List, While
+from devito.ir.iet.nodes import Call, Callable
 from devito.ir.iet.utils import derive_parameters
-from devito.symbolics import CondEq, FieldFromPointer
-from devito.tools import as_tuple, filter_sorted, split
-from devito.types import SharedData
+from devito.tools import as_tuple, filter_sorted
 
-__all__ = ['ElementalFunction', 'ElementalCall', 'make_efunc',
-           'ThreadFunction', 'make_tfunc']
+__all__ = ['ElementalFunction', 'ElementalCall', 'make_efunc']
 
 
 class ElementalFunction(Callable):
@@ -91,55 +83,3 @@ def make_efunc(name, iet, dynamic_parameters=None, retval='void', prefix='static
     """
     return ElementalFunction(name, iet, retval, derive_parameters(iet), prefix,
                              dynamic_parameters)
-
-
-class ThreadFunction(Callable):
-
-    """
-    A Callable assigned to a thread.
-    """
-
-    is_ThreadFunction = True
-
-    def __init__(self, name, body, parameters, locks, sdata):
-        super(ThreadFunction, self).__init__(name, body, 'void', parameters, ('static',))
-        self.locks = locks
-        self.sdata = sdata
-
-    def activate(self):
-        #from IPython import embed; embed()
-        pass
-
-
-def make_tfunc(name, iet, threads, locks, root, sregistry):
-    """
-    Automate the creation of ThreadFunctions.
-
-    Lock semantics adopted by the tfunc:
-
-        * A lock assuming a value of 0 means that there's work to do for the tfunc.
-          The tfunc starts executing its body, that is `iet`.
-        * Other values imply that the tfunc cannot execute yet, so it has to busy-wait.
-    """
-    required = derive_parameters(iet)
-    known = root.parameters + tuple(locks)
-    known += tuple(i for i in required if i.is_Array and i._mem_shared)
-    parameters, dynamic_parameters = split(required, lambda i: i in known)
-
-    sdata = SharedData(name=sregistry.make_name(prefix='sdata'),
-                       nthreads=threads.size, fields=dynamic_parameters)
-    parameters.append(sdata)
-
-    # Prepend the shared data, available upon thread activation
-    iet = List(body=(List(body=[Expression(DummyEq(i, FieldFromPointer(i.name, sdata[0])))
-                                for i in dynamic_parameters],
-                          footer = c.Line()), iet))
-
-    # The thread has work to do when it receives the signal that all locks have
-    # been set to 0 by the main thread
-    iet = Conditional(And(*[CondEq(i[0], 0) for i in locks]), iet)
-
-    # The thread keeps spinning until the alive flag is set to 0 by the main thread
-    iet = While(CondEq(FieldFromPointer(sdata._field_alive, sdata[0]), 1), iet)
-
-    return ThreadFunction(name, iet, parameters, locks, sdata)

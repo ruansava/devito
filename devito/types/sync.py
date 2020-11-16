@@ -16,13 +16,13 @@ from devito.parameters import configuration
 from devito.tools import (Pickable, as_tuple, ctypes_to_cstr, dtype_to_ctype,
                           dtype_to_cstr, filter_ordered)
 from devito.types.array import Array
-from devito.types.basic import LocalObject
+from devito.types.basic import LocalObject, Scalar
 from devito.types.constant import Constant
 from devito.types.dimension import CustomDimension
 
 __all__ = ['NThreads', 'NThreadsNested', 'NThreadsNonaffine', 'NThreadsMixin',
            'ThreadID', 'Lock', 'WaitLock', 'WithLock', 'FetchWait', 'FetchWaitPrefetch',
-           'Delete', 'STDThread', 'STDThreadArray', 'SharedData', 'normalize_syncs']
+           'Delete', 'STDThreadArray', 'SharedData', 'NThreadsSTD', 'normalize_syncs']
 
 
 class NThreadsMixin(object):
@@ -31,10 +31,17 @@ class NThreadsMixin(object):
 
     def __new__(cls, **kwargs):
         name = kwargs.get('name', cls.name)
-        value = cls.default_value()
+        value = cls.__value_setup__(**kwargs)
         obj = Constant.__new__(cls, name=name, dtype=np.int32, value=value)
         obj.aliases = as_tuple(kwargs.get('aliases')) + (name,)
         return obj
+
+    @classmethod
+    def __value_setup__(cls, **kwargs):
+        try:
+            return kwargs.pop('value')
+        except KeyError:
+            return cls.default_value()
 
     @property
     def _arg_names(self):
@@ -72,21 +79,19 @@ class NThreadsNonaffine(NThreads):
     name = 'nthreads_nonaffine'
 
 
+class NThreadsSTD(NThreadsMixin, Constant):
+
+    name = 'nthreads_std'
+
+    @classmethod
+    def default_value(cls):
+        return 1
+
+
 class ThreadID(CustomDimension):
 
     def __new__(cls, nthreads):
         return CustomDimension.__new__(cls, name='tid', symbolic_size=nthreads)
-
-
-class STDThread(LocalObject):
-
-    dtype = type('std::thread', (c_void_p,), {})
-
-    def __init__(self, name):
-        self.name = name
-
-    # Pickling support
-    _pickle_args = ['name']
 
 
 class ThreadArray(Array):
@@ -106,21 +111,23 @@ class ThreadArray(Array):
         try:
             return as_tuple(kwargs['dimensions']), as_tuple(kwargs['dimensions'])
         except KeyError:
-            nthreads = kwargs['nthreads']
-            dim = CustomDimension(name='i', symbolic_size=nthreads)
+            nthreads = kwargs['nthreads_std']
+            dim = CustomDimension(name='wi', symbolic_size=nthreads)
             return (dim,), (dim,)
 
     @property
-    def dimension(self):
+    def dim(self):
         assert len(self.dimensions) == 1
         return self.dimensions[0]
 
 
 class STDThreadArray(ThreadArray):
 
+    dtype = type('std::thread', (c_void_p,), {})
+
     @classmethod
     def __dtype_setup__(cls, **kwargs):
-        return STDThread.dtype
+        return cls.dtype
 
 
 class SharedData(ThreadArray):
@@ -130,7 +137,8 @@ class SharedData(ThreadArray):
     one consumer thread.
     """
     
-    _field_alive = 'alive'
+    _field_id = 'id'
+    _field_flag = 'flag'
 
     def __init_finalize__(self, *args, **kwargs):
         name = kwargs['name']
@@ -140,20 +148,33 @@ class SharedData(ThreadArray):
         self._pname = "t%s" % name
 
         pfields = [(i.name, i._C_ctype) for i in fields]
-        pfields.append((self._field_alive, c_int))
+        pfields.append((self._field_id, c_int))
+        pfields.append((self._field_flag, c_int))
         self._pfields = pfields
 
-        super(SharedData, self).__init_finalize__(*args, **kwargs)
+        super().__init_finalize__(*args, **kwargs)
 
     @cached_property
     def _C_typedecl(self):
         fields = []
         for i, j in self.pfields:
-            if i == self._field_alive:
+            if i == self._field_flag:
                 fields.append(Initializer(Value('volatile %s' % ctypes_to_cstr(j), i), 1))
             else:
                 fields.append(Value(ctypes_to_cstr(j), i))
         return Struct(self.pname, fields)
+
+    @cached_property
+    def symbolic_base(self):
+        return self[self.dim].base.label
+
+    @cached_property
+    def symbolic_id(self):
+        return Scalar(name='id', dtype=np.int32)
+
+    @cached_property
+    def symbolic_flag(self):
+        return Scalar(name='flag', dtype=np.int32)
 
     @property
     def fields_user(self):
@@ -210,6 +231,9 @@ class Lock(Array):
     def locked_dimensions(self):
         return set().union(*[d._defines for d in self.dimensions])
 
+    # Pickling support
+    _pickle_kwargs = Array._pickle_kwargs + ['target']
+
 
 class SyncOp(sympy.Expr, Pickable):
 
@@ -253,11 +277,6 @@ class SyncLock(SyncOp):
     @property
     def target(self):
         return self.lock.target
-
-    @cached_property
-    def index(self):
-        assert len(self.lock.dimensions) == 1
-        return self.handle.indices[0]
 
 
 class SyncData(SyncOp):

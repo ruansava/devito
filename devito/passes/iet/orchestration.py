@@ -6,15 +6,16 @@ import numpy as np
 
 from devito.data import FULL
 from devito.ir.equations import DummyEq
-from devito.ir.iet import (Call, Conditional, ElementalFunction, Expression, List,
-                           Iteration, PointerCast, SyncSpot, While, FindNodes,
-                           LocalExpression, Transformer, derive_parameters, make_tfunc)
+from devito.ir.iet import (Call, Callable, Conditional, ElementalFunction, Expression,
+                           List, Iteration, PointerCast, SyncSpot, While, FindNodes,
+                           LocalExpression, Transformer, DummyExpr, derive_parameters)
 from devito.ir.support import Forward
 from devito.passes.iet.engine import iet_pass
-from devito.symbolics import CondEq, FieldFromComposite, IndexedPointer, ListInitializer
-from devito.tools import as_mapper, as_list, filter_ordered, filter_sorted
-from devito.types import (STDThreadArray, WaitLock, WithLock, FetchWait,
-                          FetchWaitPrefetch, Delete, Scalar)
+from devito.symbolics import (CondEq, CondNe, FieldFromComposite, FieldFromPointer,
+                              ListInitializer)
+from devito.tools import as_mapper, as_list, filter_ordered, filter_sorted, split
+from devito.types import (NThreadsSTD, STDThreadArray, WaitLock, WithLock,
+                          FetchWait, FetchWaitPrefetch, Delete, SharedData)
 
 __init__ = ['Orchestrator']
 
@@ -44,6 +45,46 @@ class Orchestrator(object):
         """Shortcut for self._Parallelizer."""
         return self._Parallelizer
 
+    def __make_tfunc(self, name, iet, root, threads):
+        # Create the SharedData
+        required = derive_parameters(iet)
+        known = (root.parameters +
+                 tuple(i for i in required if i.is_Array and i._mem_shared))
+        parameters, dynamic_parameters = split(required, lambda i: i in known)
+
+        sdata = SharedData(name=self.sregistry.make_name(prefix='sdata'),
+                           nthreads_std=threads.size, fields=dynamic_parameters)
+        parameters.append(sdata)
+
+        # Prepend the unwinded SharedData fields, available upon thread activation
+        preactions = [DummyExpr(i, FieldFromPointer(i.name, sdata.symbolic_base))
+                      for i in dynamic_parameters]
+        preactions.append(DummyExpr(sdata.symbolic_id,
+                                    FieldFromPointer(sdata._field_id,
+                                                     sdata.symbolic_base)))
+
+        # Append the flag reset
+        postactions = [List(
+            header=c.Line(),
+            body=Expression(DummyEq(FieldFromPointer(sdata._field_flag,
+                                                     sdata.symbolic_base), 1))
+        )]
+
+        iet = List(body=preactions + [iet] + postactions)
+
+        # Append the flag reset
+
+        # The thread has work to do when it receives the signal that all locks have
+        # been set to 0 by the main thread
+        iet = Conditional(CondEq(FieldFromPointer(sdata._field_flag,
+                                                  sdata.symbolic_base), 2), iet)
+
+        # The thread keeps spinning until the alive flag is set to 0 by the main thread
+        iet = While(CondNe(FieldFromPointer(sdata._field_flag, sdata.symbolic_base), 0),
+                    iet)
+
+        return Callable(name, iet, 'void', parameters, ('static',)), sdata
+
     def _make_waitlock(self, iet, sync_ops, *args):
         waitloop = List(
             header=c.Comment("Wait for `%s` to be copied to the host" %
@@ -59,75 +100,70 @@ class Orchestrator(object):
     def _make_withlock(self, iet, sync_ops, pieces, root):
         locks = sorted({s.lock for s in sync_ops}, key=lambda i: i.name)
 
-        # Determine the number of threads required for `iet` with the given `sync_ops`
-        lock_sizes = {i.size for i in locks}
-        assert len(lock_sizes) == 1
-        nthreads = lock_sizes.pop()
-
-        # The queueid starting point so that different threads logically owns
-        # different streaming queues
-        base = 1 + sum(i.size for i in pieces.threads)
-        queueid = Scalar(name='queueid', dtype=np.int32)
-
         # The std::thread array
-        threads = STDThreadArray(name=self.sregistry.make_name(prefix='threads'),
-                                 nthreads=nthreads)
-        pieces.threads.append(threads)
+        name = self.sregistry.make_name(prefix='threads')
+        nthreads_std = NThreadsSTD(name='%s_std' % name, value=min(i.size for i in locks))
+        threads = STDThreadArray(name=name, nthreads_std=nthreads_std)
 
-        setlock = []
-        actions = []
+        preactions = []
+        postactions = []
         for s in sync_ops:
-            setlock.append(Expression(DummyEq(s.handle, 0)))
-
             imask = [s.handle.indices[d] if d.root in s.lock.locked_dimensions else FULL
                      for d in s.target.dimensions]
 
-            actions.append(List(
-                body=[Expression(DummyEq(queueid, base + s.index)),
-                      List(header=c.Line()),
-                      List(header=self._P._map_update_wait_host(s.target, imask, queueid),
-                           body=Expression(DummyEq(s.lock[0], 1)),
-                           footer=c.Line())]
+            preactions.append(List(
+                body=[List(header=c.Line()),
+                      List(header=self._P._map_update_wait_host(s.target, imask,
+                                                                SharedData._field_id),
+                           body=DummyExpr(s.handle, 1), footer=c.Line())]
             ))
+            postactions.append(List(header=c.Line(), body=DummyExpr(s.handle, 2)))
 
         # Turn `iet` into an ElementalFunction so that it can be
         # executed asynchronously by `threadhost`
         name = self.sregistry.make_name(prefix='copy_device_to_host')
-        body = List(body=tuple(actions) + iet.body)
-        # TODO: rather pass in `handles` not `locks` ?
-        tfunc = make_tfunc(name, body, threads, locks, root, self.sregistry)
+        body = List(body=tuple(preactions) + iet.body + tuple(postactions))
+        tfunc, sdata = self.__make_tfunc(name, body, root, threads)
         pieces.tfuncs.append(tfunc)
 
         # Replace `iet` with actions to fire up the `tfunc`
-        iet = List(
-            header=[c.Line(),
-                    c.Comment("Activate `%s` to perform the copy" % threads)],
-            body=tfunc.activate() + setlock
-        )
+        actions = []
+        d = threads.dim
+        condition = Or(*([CondNe(s.handle, 2) for s in sync_ops] +
+                         [CondNe(sdata[d], 1)]))
+        activation = [DummyExpr(d, 0),
+                      While(condition, DummyExpr(d, (d + 1) % threads.size))]
+        activation.extend([DummyExpr(FieldFromComposite(i.name, sdata[d]), i)
+                           for i in sdata.fields_user])
+        activation.extend([DummyExpr(s.handle, 0) for s in sync_ops])
+        activation.append(DummyExpr(FieldFromComposite(sdata._field_flag, sdata[d]), 2))
+        iet = List(header=[c.Line(), c.Comment("Activate `%s`" % threads)],
+                   body=activation, footer=c.Line())
 
         # Initialize the locks
         for i in locks:
-            values = np.ones(i.shape, dtype=np.int32).tolist()
+            values = np.full(i.shape, 2, dtype=np.int32).tolist()
             pieces.init.append(LocalExpression(DummyEq(i, ListInitializer(values))))
 
         # Fire up the threads
-        #TODO
-        #body = Call('std::thread', tfunc.make_call(is_indirect=True),
-        #            retobj=threads[threads.dimension])
-        #threadsinit = Iteration(body, threads.dimension, threads.size - 1)
-        #pieces.init.append(threadsinit)
+        idinit = DummyExpr(FieldFromComposite(sdata._field_id, sdata[d]),
+                           1 + sum(i.size for i in pieces.threads) + d)
+        arguments = list(tfunc.parameters)
+        arguments[-1] = sdata.symbolic_base + d
+        call = Call('std::thread', Call(tfunc.name, arguments, is_indirect=True),
+                    retobj=threads[d])
+        threadsinit = Iteration([idinit, call], d, threads.size - 1)
+        pieces.threads.append(threads)
+        pieces.init.append(threadsinit)
 
         # Final wait before jumping back to Python land
-        sdata = tfunc.sdata
-        body = [Expression(DummyEq(FieldFromComposite(sdata._field_alive,
-                                                      sdata[threads.dimension]), 0)),
-                Call(FieldFromComposite('join', threads[threads.dimension]))]
-        threadswait = Iteration(body, threads.dimension, threads.size - 1)
+        body = [DummyExpr(FieldFromComposite(sdata._field_flag, sdata[threads.dim]), 0),
+                Call(FieldFromComposite('join', threads[threads.dim]))]
+        threadswait = Iteration(body, threads.dim, threads.size - 1)
         pieces.finalize.append(List(
             header=c.Comment("Wait for completion of %s" % threads),
             body=threadswait
         ))
-        from IPython import embed; embed()
 
         return iet
 
