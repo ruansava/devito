@@ -106,8 +106,9 @@ class ThreadFunction(Callable):
         self.locks = locks
         self.sdata = sdata
 
-    def wakeup(self, n):
-        from IPython import embed; embed()
+    def activate(self):
+        #from IPython import embed; embed()
+        pass
 
 
 def make_tfunc(name, iet, threads, locks, root, sregistry):

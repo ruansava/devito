@@ -206,7 +206,7 @@ class Lock(Array):
     def _C_typedata(self):
         return 'volatile %s' % dtype_to_cstr(self.dtype)
 
-    @property
+    @cached_property
     def locked_dimensions(self):
         return set().union(*[d._defines for d in self.dimensions])
 
@@ -253,6 +253,11 @@ class SyncLock(SyncOp):
     @property
     def target(self):
         return self.lock.target
+
+    @cached_property
+    def index(self):
+        assert len(self.lock.dimensions) == 1
+        return self.handle.indices[0]
 
 
 class SyncData(SyncOp):

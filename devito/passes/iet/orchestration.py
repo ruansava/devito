@@ -14,7 +14,7 @@ from devito.passes.iet.engine import iet_pass
 from devito.symbolics import CondEq, FieldFromComposite, IndexedPointer, ListInitializer
 from devito.tools import as_mapper, as_list, filter_ordered, filter_sorted
 from devito.types import (STDThreadArray, WaitLock, WithLock, FetchWait,
-                          FetchWaitPrefetch, Delete)
+                          FetchWaitPrefetch, Delete, Scalar)
 
 __init__ = ['Orchestrator']
 
@@ -59,16 +59,20 @@ class Orchestrator(object):
     def _make_withlock(self, iet, sync_ops, pieces, root):
         locks = sorted({s.lock for s in sync_ops}, key=lambda i: i.name)
 
-        # Determine the number of threads requires for `iet` with the given `sync_ops`
+        # Determine the number of threads required for `iet` with the given `sync_ops`
         lock_sizes = {i.size for i in locks}
         assert len(lock_sizes) == 1
         nthreads = lock_sizes.pop()
+
+        # The queueid starting point so that different threads logically owns
+        # different streaming queues
+        base = 1 + sum(i.size for i in pieces.threads)
+        queueid = Scalar(name='queueid', dtype=np.int32)
 
         # The std::thread array
         threads = STDThreadArray(name=self.sregistry.make_name(prefix='threads'),
                                  nthreads=nthreads)
         pieces.threads.append(threads)
-        queueid = sum(i.size for i in pieces.threads)
 
         setlock = []
         actions = []
@@ -77,29 +81,29 @@ class Orchestrator(object):
 
             imask = [s.handle.indices[d] if d.root in s.lock.locked_dimensions else FULL
                      for d in s.target.dimensions]
+
             actions.append(List(
-                header=self._P._map_update_wait_host(s.target, imask, queueid=queueid),
-                body=Expression(DummyEq(s.lock[0], 1)),
-                footer=c.Line()
+                body=[Expression(DummyEq(queueid, base + s.index)),
+                      List(header=c.Line()),
+                      List(header=self._P._map_update_wait_host(s.target, imask, queueid),
+                           body=Expression(DummyEq(s.lock[0], 1)),
+                           footer=c.Line())]
             ))
 
         # Turn `iet` into an ElementalFunction so that it can be
         # executed asynchronously by `threadhost`
         name = self.sregistry.make_name(prefix='copy_device_to_host')
         body = List(body=tuple(actions) + iet.body)
+        # TODO: rather pass in `handles` not `locks` ?
         tfunc = make_tfunc(name, body, threads, locks, root, self.sregistry)
         pieces.tfuncs.append(tfunc)
 
         # Replace `iet` with actions to fire up the `tfunc`
-        #TODO
-        #iet = List(
-        #    header=c.Line(),
-        #    body=setlock + [List(
-        #        header=[c.Line(), c.Comment("Spawn %s to perform the copy" % thread)],
-        #        body=Call('std::thread', efunc.make_call(is_indirect=True),
-        #                  retobj=thread,)
-        #    )]
-        #)
+        iet = List(
+            header=[c.Line(),
+                    c.Comment("Activate `%s` to perform the copy" % threads)],
+            body=tfunc.activate() + setlock
+        )
 
         # Initialize the locks
         for i in locks:
@@ -141,9 +145,16 @@ class Orchestrator(object):
         return iet
 
     def _make_fetchwaitprefetch(self, iet, sync_ops, pieces, *args):
-        thread = STDThread(self.sregistry.make_name(prefix='thread'))
-        pieces.threads.append(thread)
-        queueid = len(pieces.threads)
+        # The queueid starting point so that different threads logically owns
+        # different streaming queues
+        base = 1 + sum(i.size for i in pieces.threads)
+
+        # The std::thread array
+        threads = STDThreadArray(name=self.sregistry.make_name(prefix='threads'),
+                                 nthreads=nthreads)
+        pieces.threads.append(threads)
+
+        # !!! BELOW: TODO !!!
 
         threadwait = Call(FieldFromComposite('join', thread))
 
