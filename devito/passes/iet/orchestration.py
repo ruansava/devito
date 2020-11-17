@@ -112,7 +112,8 @@ class Orchestrator(object):
     def __make_finalize_threads(self, threads, sdata):
         d = threads.dim
 
-        body = [DummyExpr(FieldFromComposite(sdata._field_flag, sdata[d]), 0),
+        body = [While(CondEq(FieldFromComposite(sdata._field_flag, sdata[d]), 2)),
+                DummyExpr(FieldFromComposite(sdata._field_flag, sdata[d]), 0),
                 Call(FieldFromComposite('join', threads[d]))]
         threadswait = List(
             header=c.Comment("Wait for completion of %s" % threads.name),
@@ -176,7 +177,7 @@ class Orchestrator(object):
         name = self.sregistry.make_name(prefix='copy_device_to_host')
         body = List(body=tuple(preactions) + iet.body + tuple(postactions))
         tfunc, sdata = self.__make_tfunc(name, body, root, threads)
-        pieces.tfuncs.append(tfunc)
+        pieces.funcs.append(tfunc)
 
         # Schedule computation to the first available thread
         iet = self.__make_activate_thread(threads, sdata, sync_ops)
@@ -251,24 +252,27 @@ class Orchestrator(object):
         name = self.sregistry.make_name(prefix='init_device')
         body = List(body=casts + fetches)
         parameters = filter_sorted(functions + derive_parameters(body))
-        tfunc = Callable(name, body, 'void', parameters, 'static')
-        pieces.tfuncs.append(tfunc)
+        func = Callable(name, body, 'void', parameters, 'static')
+        pieces.funcs.append(func)
 
         # Perform initial fetch by the main thread
         pieces.init.append(List(
             header=c.Comment("Initialize data stream for `%s`" % threads.name),
-            body=Call(name, tfunc.parameters),
+            body=Call(name, func.parameters),
             footer=c.Line()
         ))
 
         # Turn prefetch IET into a threaded Callable
         name = self.sregistry.make_name(prefix='prefetch_host_to_device')
-        body = List(body=casts + prefetches)
+        body = List(header=c.Line(), body=casts + prefetches)
         tfunc, sdata = self.__make_tfunc(name, body, root, threads)
-        pieces.tfuncs.append(tfunc)
+        pieces.funcs.append(tfunc)
 
-        # Activate prefetch thread
-        iet = self.__make_activate_thread(threads, sdata, sync_ops)
+        # Glue together all the IET pieces, including the activation bits
+        iet = List(
+            header=[c.Line()] + presents,
+            body=(iet, self.__make_activate_thread(threads, sdata, sync_ops))
+        )
 
         # Fire up the threads
         pieces.init.append(self.__make_init_threads(threads, sdata, tfunc, pieces))
@@ -318,7 +322,7 @@ class Orchestrator(object):
         if not sync_spots:
             return iet, {}
 
-        pieces = namedtuple('Pieces', 'init finalize tfuncs threads')([], [], [], [])
+        pieces = namedtuple('Pieces', 'init finalize funcs threads')([], [], [], [])
 
         subs = {}
         for n in sync_spots:
@@ -333,6 +337,6 @@ class Orchestrator(object):
         finalize = List(header=c.Line(), body=pieces.finalize)
         iet = iet._rebuild(body=(init,) + iet.body + (finalize,))
 
-        return iet, {'efuncs': pieces.tfuncs,
+        return iet, {'efuncs': pieces.funcs,
                      'includes': ['thread'],
                      'args': [i.size for i in pieces.threads]}
