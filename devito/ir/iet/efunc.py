@@ -2,7 +2,7 @@ from cached_property import cached_property
 
 from devito.ir.iet.nodes import Call, Callable
 from devito.ir.iet.utils import derive_parameters
-from devito.tools import as_tuple, filter_sorted
+from devito.tools import as_tuple
 
 __all__ = ['ElementalFunction', 'ElementalCall', 'make_efunc']
 

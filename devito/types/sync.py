@@ -5,7 +5,7 @@ device offloading, etc.
 
 import os
 from collections import defaultdict
-from ctypes import POINTER, Structure, c_int, c_void_p
+from ctypes import POINTER, c_int, c_void_p
 
 from cgen import Initializer, Struct, Value
 from cached_property import cached_property
@@ -16,7 +16,7 @@ from devito.parameters import configuration
 from devito.tools import (Pickable, as_tuple, ctypes_to_cstr, dtype_to_ctype,
                           dtype_to_cstr, filter_ordered)
 from devito.types.array import Array, ArrayObject
-from devito.types.basic import LocalObject, Scalar
+from devito.types.basic import Scalar
 from devito.types.constant import Constant
 from devito.types.dimension import CustomDimension
 
@@ -126,7 +126,7 @@ class SharedData(ThreadArray):
     An Array of structs, each struct containing data shared by one producer and
     one consumer thread.
     """
-    
+
     _field_id = 'id'
     _field_flag = 'flag'
 

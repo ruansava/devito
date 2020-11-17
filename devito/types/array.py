@@ -7,7 +7,7 @@ from cgen import Struct, Value
 
 from devito.parameters import configuration
 from devito.tools import as_tuple, ctypes_to_cstr, dtype_to_ctype
-from devito.types.basic import AbstractFunction, LocalObject
+from devito.types.basic import AbstractFunction
 
 __all__ = ['Array', 'ArrayObject', 'PointerArray']
 

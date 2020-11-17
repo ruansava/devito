@@ -642,10 +642,8 @@ class Callable(Node):
         self.parameters = as_tuple(parameters)
 
     def __repr__(self):
-        parameters = ",".join(['void*' if i.is_Object else dtype_to_cstr(i.dtype)
-                               for i in self.parameters])
         return "%s[%s]<%s; %s>" % (self.__class__.__name__, self.name, self.retval,
-                                   parameters)
+                                   ",".join([i._C_typename for i in self.parameters]))
 
     @property
     def functions(self):
