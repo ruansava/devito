@@ -102,7 +102,10 @@ class Orchestrator(object):
         arguments[-1] = sdata.symbolic_base + d
         call = Call('std::thread', Call(tfunc.name, arguments, is_indirect=True),
                     retobj=threads[d])
-        threadsinit = Iteration([idinit, call], d, threads.size - 1)
+        threadsinit = List(
+            header=c.Comment("Fire up and initialize `%ss`" % threads.name),
+            body=Iteration([idinit, call], d, threads.size - 1)
+        )
 
         return threadsinit
 
@@ -224,8 +227,7 @@ class Orchestrator(object):
 
             # Construct fetch IET
             imask = [(fc, s.size) if d.root is s.dim.root else FULL for d in s.dimensions]
-            fetch = List(header=self._P._map_to_wait(s.function, imask,
-                                                     SharedData._field_id))
+            fetch = List(header=self._P._map_to(s.function, imask))
             fetches.append(Conditional(fc_cond, fetch))
 
             # Construct present clauses
@@ -243,49 +245,36 @@ class Orchestrator(object):
         functions = filter_ordered(s.function for s in sync_ops)
         casts = [PointerCast(f) for f in functions]
 
-        # Turn init IET into an efunc
+        # Turn init IET into a Callable
         name = self.sregistry.make_name(prefix='init_device')
         body = List(body=casts + fetches)
         parameters = filter_sorted(functions + derive_parameters(body))
         tfunc = Callable(name, body, 'void', parameters, 'static')
         pieces.tfuncs.append(tfunc)
 
-        # Turn prefetch IET into an efunc
+        # Perform initial fetch by the main thread
+        pieces.init.append(List(
+            header=c.Comment("Initialize data stream for `%s`" % threads.name),
+            body=Call(name, tfunc.parameters),
+            footer=c.Line()
+        ))
+
+        # Turn prefetch IET into a threaded Callable
         name = self.sregistry.make_name(prefix='prefetch_host_to_device')
         body = List(body=casts + prefetches)
-        parameters = filter_sorted(functions + derive_parameters(body))
-        #TODO TRY via __make_tfunc ??
-        from IPython import embed; embed()
-        efunc = ElementalFunction(name, body, 'void', parameters)
-        pieces.tfuncs.append(efunc)
+        tfunc, sdata = self.__make_tfunc(name, body, root, threads)
+        pieces.tfuncs.append(tfunc)
 
-        # Call prefetch IET
-        efunc_call = efunc.make_call(is_indirect=True)
-        call = Call('std::thread', efunc_call, retobj=thread)
-
-        # Glue together all the new IET pieces
-        iet = List(
-            header=[c.Line(),
-                    c.Comment("Wait for %s to be available again" % thread)],
-            body=[threadwait, List(
-                header=[c.Line()] + presents,
-                body=(iet, List(
-                    header=[c.Line(), c.Comment("Spawn %s to prefetch data" % thread)],
-                    body=call,
-                    footer=c.Line()
-                ),)
-            )]
-        )
+        # Activate prefetch thread
+        iet = self.__make_activate_thread(threads, sdata, sync_ops)
 
         # Fire up the threads
         pieces.init.append(self.__make_init_threads(threads, sdata, tfunc, pieces))
         pieces.threads.append(threads)
 
         # Final wait before jumping back to Python land
-        pieces.finalize.append(List(
-            header=c.Comment("Wait for completion of %s" % thread),
-            body=threadwait
-        ))
+        # Final wait before jumping back to Python land
+        pieces.finalize.append(self.__make_finalize_threads(threads, sdata))
 
         return iet
 
