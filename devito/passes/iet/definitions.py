@@ -108,7 +108,8 @@ class DataManager(object):
         Allocate an Array of Objects in the low latency memory.
         """
         shape = "".join("[%s]" % ccode(i) for i in obj.symbolic_shape)
-        decl = "%s%s" % (obj.name, shape)
+        alignment = "__attribute__((aligned(%d)))" % obj._data_alignment
+        decl = "%s%s %s" % (obj.name, shape, alignment)
 
         storage.update(obj, site, allocs=c.Value(obj._C_typedata, decl))
 
