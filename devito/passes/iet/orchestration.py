@@ -270,8 +270,9 @@ class Orchestrator(object):
 
         # Glue together all the IET pieces, including the activation bits
         iet = List(
-            header=[c.Line()] + presents,
-            body=(iet, self.__make_activate_thread(threads, sdata, sync_ops))
+            body=[self.__make_activate_thread(threads, sdata, sync_ops),
+                  List(header=presents), iet],
+            footer=c.Line()
         )
 
         # Fire up the threads
