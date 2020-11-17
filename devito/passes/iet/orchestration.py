@@ -15,7 +15,7 @@ from devito.symbolics import (CondEq, CondNe, FieldFromComposite, FieldFromPoint
                               ListInitializer)
 from devito.tools import as_mapper, as_list, filter_ordered, filter_sorted, split
 from devito.types import (NThreadsSTD, STDThreadArray, WaitLock, WithLock,
-                          FetchWait, FetchWaitPrefetch, Delete, SharedData)
+                          FetchWait, FetchWaitPrefetch, Delete, SharedData, Symbol)
 
 __init__ = ['Orchestrator']
 
@@ -88,7 +88,7 @@ class Orchestrator(object):
     def __make_threads(self, value=None):
         value = value or 1
         name = self.sregistry.make_name(prefix='threads')
-        nthreads_std = NThreadsSTD(name='%s_std' % name, value=value)
+        nthreads_std = NThreadsSTD(name='np%s' % name, value=value)
         threads = STDThreadArray(name=name, nthreads_std=nthreads_std)
 
         return threads
@@ -123,14 +123,16 @@ class Orchestrator(object):
 
     def __make_activate_thread(self, threads, sdata, sync_ops):
         d = threads.dim
+        sd = Symbol(name=d.name, dtype=np.int32)
+
         sync_locks = [s for s in sync_ops if s.is_SyncLock]
 
         condition = Or(*([CondNe(s.handle, 2) for s in sync_locks] +
                          [CondNe(FieldFromComposite(sdata._field_flag, sdata[d]), 1)]))
-        activation = [DummyExpr(d, 0),
-                      While(condition, DummyExpr(d, (d + 1) % threads.size))]
+        activation = [DummyExpr(sd, 0),
+                      While(condition, DummyExpr(sd, (sd + 1) % threads.size))]
         activation.extend([DummyExpr(FieldFromComposite(i.name, sdata[d]), i)
-                           for i in sdata.fields_user])
+                           for i in sdata.fields])
         activation.extend([DummyExpr(s.handle, 0) for s in sync_locks])
         activation.append(DummyExpr(FieldFromComposite(sdata._field_flag, sdata[d]), 2))
         activation = List(header=[c.Line(), c.Comment("Activate `%s`" % threads.name)],
@@ -331,4 +333,6 @@ class Orchestrator(object):
         finalize = List(header=c.Line(), body=pieces.finalize)
         iet = iet._rebuild(body=(init,) + iet.body + (finalize,))
 
-        return iet, {'efuncs': pieces.tfuncs, 'includes': ['thread']}
+        return iet, {'efuncs': pieces.tfuncs,
+                     'includes': ['thread'],
+                     'args': [i.size for i in pieces.threads]}

@@ -5,7 +5,7 @@ device offloading, etc.
 
 import os
 from collections import defaultdict
-from ctypes import POINTER, c_int, c_void_p
+from ctypes import POINTER, Structure, c_int, c_void_p
 
 from cgen import Initializer, Struct, Value
 from cached_property import cached_property
@@ -15,7 +15,7 @@ import sympy
 from devito.parameters import configuration
 from devito.tools import (Pickable, as_tuple, ctypes_to_cstr, dtype_to_ctype,
                           dtype_to_cstr, filter_ordered)
-from devito.types.array import Array
+from devito.types.array import Array, ArrayObject
 from devito.types.basic import LocalObject, Scalar
 from devito.types.constant import Constant
 from devito.types.dimension import CustomDimension
@@ -94,17 +94,7 @@ class ThreadID(CustomDimension):
         return CustomDimension.__new__(cls, name='tid', symbolic_size=nthreads)
 
 
-class ThreadArray(Array):
-
-    def __init_finalize__(self, *args, **kwargs):
-        kwargs['scope'] = 'stack'
-        kwargs['sharing'] = 'shared'
-        super().__init_finalize__(*args, **kwargs)
-
-    def __padding_setup__(self, **kwargs):
-        # Bypass padding which is useless for STDThreadArrays
-        kwargs['padding'] = 0
-        return super().__padding_setup__(**kwargs)
+class ThreadArray(ArrayObject):
 
     @classmethod
     def __indices_setup__(cls, **kwargs):
@@ -140,19 +130,12 @@ class SharedData(ThreadArray):
     _field_id = 'id'
     _field_flag = 'flag'
 
-    def __init_finalize__(self, *args, **kwargs):
-        name = kwargs['name']
-        fields = kwargs.pop('fields')
-
-        self._fields_user = fields
-        self._pname = "t%s" % name
-
-        pfields = [(i.name, i._C_ctype) for i in fields]
-        pfields.append((self._field_id, c_int))
-        pfields.append((self._field_flag, c_int))
-        self._pfields = pfields
-
-        super().__init_finalize__(*args, **kwargs)
+    @classmethod
+    def __pfields_setup__(cls, **kwargs):
+        pfields = super().__pfields_setup__(**kwargs)
+        pfields.extend([(cls._field_id, c_int),
+                        (cls._field_flag, c_int)])
+        return pfields
 
     @cached_property
     def _C_typedecl(self):
@@ -175,21 +158,6 @@ class SharedData(ThreadArray):
     @cached_property
     def symbolic_flag(self):
         return Scalar(name='flag', dtype=np.int32)
-
-    @property
-    def fields_user(self):
-        return self._fields_user
-
-    @property
-    def pname(self):
-        return self._pname
-
-    @property
-    def pfields(self):
-        return self._pfields
-
-    # Pickling support
-    _pickle_kwargs = ThreadArray._pickle_kwargs + ['fields_user']
 
 
 class Lock(Array):
