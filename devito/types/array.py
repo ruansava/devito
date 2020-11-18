@@ -7,7 +7,7 @@ from cgen import Struct, Value
 
 from devito.parameters import configuration
 from devito.tools import as_tuple, ctypes_to_cstr, dtype_to_ctype
-from devito.types.basic import AbstractFunction
+from devito.types.basic import AbstractFunction, IndexedData, Symbol
 
 __all__ = ['Array', 'ArrayObject', 'PointerArray']
 
@@ -268,6 +268,14 @@ class ArrayObject(ArrayBasic):
     @property
     def pname(self):
         return self._pname
+
+    @cached_property
+    def indexed(self):
+        """The wrapped IndexedData object."""
+        # Set the label's dtype to None to make the ObjectArray pickable
+        return IndexedData(Symbol(name=self.name, dtype=None),
+                           shape=self.shape,
+                           function=self.function)
 
     # Pickling support
     _pickle_kwargs = ArrayBasic._pickle_kwargs + ['dimensions', 'fields']
