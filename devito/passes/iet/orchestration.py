@@ -8,12 +8,13 @@ from devito.data import FULL
 from devito.ir.equations import DummyEq
 from devito.ir.iet import (Call, Callable, Conditional, Expression, List, Iteration,
                            PointerCast, SyncSpot, While, FindNodes, LocalExpression,
-                           Transformer, DummyExpr, derive_parameters)
+                           Transformer, BlankLine, DummyExpr, derive_parameters)
 from devito.ir.support import Forward
 from devito.passes.iet.engine import iet_pass
 from devito.symbolics import (CondEq, CondNe, FieldFromComposite, FieldFromPointer,
                               ListInitializer)
-from devito.tools import as_mapper, as_list, filter_ordered, filter_sorted, split
+from devito.tools import (as_mapper, as_list, filter_ordered, filter_sorted,
+                          is_integer, split)
 from devito.types import (NThreadsSTD, STDThreadArray, WaitLock, WithLock,
                           FetchWait, FetchWaitPrefetch, Delete, SharedData, Symbol)
 
@@ -64,11 +65,10 @@ class Orchestrator(object):
                                                      sdata.symbolic_base)))
 
         # Append the flag reset
-        postactions = [List(
-            header=c.Line(),
-            body=Expression(DummyEq(FieldFromPointer(sdata._field_flag,
-                                                     sdata.symbolic_base), 1))
-        )]
+        postactions = [List(body=[
+            BlankLine,
+            DummyExpr(FieldFromPointer(sdata._field_flag, sdata.symbolic_base), 1)
+        ])]
 
         iet = List(body=preactions + [iet] + postactions)
 
@@ -86,15 +86,22 @@ class Orchestrator(object):
         return Callable(name, iet, 'void', parameters, 'static'), sdata
 
     def __make_threads(self, value=None):
-        value = value or 1
         name = self.sregistry.make_name(prefix='threads')
-        nthreads_std = NThreadsSTD(name='np%s' % name, value=value)
-        threads = STDThreadArray(name=name, nthreads_std=nthreads_std)
+
+        if value is None:
+            threads = STDThreadArray(name=name, nthreads_std=1)
+        else:
+            nthreads_std = NThreadsSTD(name='np%s' % name, value=value)
+            threads = STDThreadArray(name=name, nthreads_std=nthreads_std)
 
         return threads
 
     def __make_init_threads(self, threads, sdata, tfunc, pieces):
-        d = threads.dim
+        d = threads.index
+        if threads.size == 1:
+            callback = lambda body: body
+        else:
+            callback = lambda body: Iteration(body, d, threads.size - 1)
 
         idinit = DummyExpr(FieldFromComposite(sdata._field_id, sdata[d]),
                            1 + sum(i.size for i in pieces.threads) + d)
@@ -103,41 +110,53 @@ class Orchestrator(object):
         call = Call('std::thread', Call(tfunc.name, arguments, is_indirect=True),
                     retobj=threads[d])
         threadsinit = List(
-            header=c.Comment("Fire up and initialize `%ss`" % threads.name),
-            body=Iteration([idinit, call], d, threads.size - 1)
+            header=c.Comment("Fire up and initialize `%s`" % threads.name),
+            body=callback([idinit, call])
         )
 
         return threadsinit
 
     def __make_finalize_threads(self, threads, sdata):
-        d = threads.dim
+        d = threads.index
+        if threads.size == 1:
+            callback = lambda body: body
+        else:
+            callback = lambda body: Iteration(body, d, threads.size - 1)
 
-        body = [While(CondEq(FieldFromComposite(sdata._field_flag, sdata[d]), 2)),
-                DummyExpr(FieldFromComposite(sdata._field_flag, sdata[d]), 0),
-                Call(FieldFromComposite('join', threads[d]))]
         threadswait = List(
-            header=c.Comment("Wait for completion of %s" % threads.name),
-            body=Iteration(body, d, threads.size - 1)
+            header=c.Comment("Wait for completion of `%s`" % threads.name),
+            body=callback([
+                While(CondEq(FieldFromComposite(sdata._field_flag, sdata[d]), 2)),
+                DummyExpr(FieldFromComposite(sdata._field_flag, sdata[d]), 0),
+                Call(FieldFromComposite('join', threads[d]))
+            ])
         )
 
         return threadswait
 
     def __make_activate_thread(self, threads, sdata, sync_ops):
-        d = threads.dim
-        sd = Symbol(name=d.name, dtype=np.int32)
+        d = threads.index
 
         sync_locks = [s for s in sync_ops if s.is_SyncLock]
-
         condition = Or(*([CondNe(s.handle, 2) for s in sync_locks] +
                          [CondNe(FieldFromComposite(sdata._field_flag, sdata[d]), 1)]))
-        activation = [DummyExpr(sd, 0),
-                      While(condition, DummyExpr(sd, (sd + 1) % threads.size))]
+
+        if threads.size == 1:
+            activation = [While(condition)]
+        else:
+            sd = Symbol(name=d.name, dtype=np.int32)
+            activation = [DummyExpr(sd, 0),
+                          While(condition, DummyExpr(sd, (sd + 1) % threads.size))]
+
         activation.extend([DummyExpr(FieldFromComposite(i.name, sdata[d]), i)
                            for i in sdata.fields])
         activation.extend([DummyExpr(s.handle, 0) for s in sync_locks])
         activation.append(DummyExpr(FieldFromComposite(sdata._field_flag, sdata[d]), 2))
-        activation = List(header=[c.Line(), c.Comment("Activate `%s`" % threads.name)],
-                          body=activation, footer=c.Line())
+        activation = List(
+            header=[c.Line(), c.Comment("Activate `%s`" % threads.name)],
+            body=activation,
+            footer=c.Line()
+        )
 
         return activation
 
@@ -164,12 +183,13 @@ class Orchestrator(object):
             imask = [s.handle.indices[d] if d.root in s.lock.locked_dimensions else FULL
                      for d in s.target.dimensions]
 
-            preactions.append(List(
-                body=[List(header=c.Line()),
-                      List(header=self._P._map_update_wait_host(s.target, imask,
-                                                                SharedData._field_id),
-                           body=DummyExpr(s.handle, 1), footer=c.Line())]
-            ))
+            preactions.append(List(body=[
+                BlankLine,
+                List(header=self._P._map_update_wait_host(s.target, imask,
+                                                          SharedData._field_id)),
+                DummyExpr(s.handle, 1),
+                BlankLine
+            ]))
             postactions.append(List(header=c.Line(), body=DummyExpr(s.handle, 2)))
 
         # Turn `iet` into an ElementalFunction so that it can be
@@ -258,8 +278,7 @@ class Orchestrator(object):
         # Perform initial fetch by the main thread
         pieces.init.append(List(
             header=c.Comment("Initialize data stream for `%s`" % threads.name),
-            body=Call(name, func.parameters),
-            footer=c.Line()
+            body=[Call(name, func.parameters), BlankLine]
         ))
 
         # Turn prefetch IET into a threaded Callable
@@ -269,17 +288,18 @@ class Orchestrator(object):
         pieces.funcs.append(tfunc)
 
         # Glue together all the IET pieces, including the activation bits
-        iet = List(
-            body=[self.__make_activate_thread(threads, sdata, sync_ops),
-                  List(header=presents), iet],
-            footer=c.Line()
-        )
+        iet = List(body=[
+            BlankLine,
+            While(CondNe(FieldFromComposite(sdata._field_flag, sdata[threads.index]), 1)),
+            List(header=presents),
+            iet,
+            self.__make_activate_thread(threads, sdata, sync_ops)
+        ])
 
         # Fire up the threads
         pieces.init.append(self.__make_init_threads(threads, sdata, tfunc, pieces))
         pieces.threads.append(threads)
 
-        # Final wait before jumping back to Python land
         # Final wait before jumping back to Python land
         pieces.finalize.append(self.__make_finalize_threads(threads, sdata))
 
@@ -340,4 +360,4 @@ class Orchestrator(object):
 
         return iet, {'efuncs': pieces.funcs,
                      'includes': ['thread'],
-                     'args': [i.size for i in pieces.threads]}
+                     'args': [i.size for i in pieces.threads if not is_integer(i.size)]}

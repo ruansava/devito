@@ -15,7 +15,7 @@ from devito.ir.support import (SEQUENTIAL, PARALLEL, PARALLEL_IF_ATOMIC, VECTORI
                                AFFINE, Property, Forward, detect_io)
 from devito.symbolics import ListInitializer, FunctionFromPointer, as_symbol, ccode
 from devito.tools import (Signer, as_tuple, filter_ordered, filter_sorted, flatten,
-                          validate_type, dtype_to_cstr)
+                          validate_type)
 from devito.types import Symbol, Indexed
 from devito.types.basic import AbstractFunction
 

@@ -110,6 +110,13 @@ class ThreadArray(ArrayObject):
         assert len(self.dimensions) == 1
         return self.dimensions[0]
 
+    @property
+    def index(self):
+        if self.size == 1:
+            return 0
+        else:
+            return self.dim
+
 
 class STDThreadArray(ThreadArray):
 
