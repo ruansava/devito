@@ -24,7 +24,7 @@ __all__ = ['Node', 'Block', 'Expression', 'Element', 'Callable', 'Call', 'Condit
            'MetaCall', 'PointerCast', 'ForeignExpression', 'HaloSpot', 'IterationTree',
            'ExpressionBundle', 'AugmentedExpression', 'Increment', 'Return', 'While',
            'ParallelIteration', 'ParallelBlock', 'Dereference', 'Lambda', 'SyncSpot',
-           'DummyExpr']
+           'DummyExpr', 'BlankLine']
 
 # First-class IET nodes
 
@@ -1048,10 +1048,20 @@ class SyncSpot(List):
         return "<SyncSpot (%s)>" % ",".join(str(i) for i in self.sync_ops)
 
 
+class CBlankLine(List):
+
+    def __init__(self, **kwargs):
+        super().__init__(header=c.Line())
+
+    def __repr__(self):
+        return ""
+
+
 def DummyExpr(*args):
     return Expression(DummyEq(*args))
 
 
+BlankLine = CBlankLine()
 Return = lambda i='': Element(c.Statement('return%s' % ((' %s' % i) if i else i)))
 
 
