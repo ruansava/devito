@@ -270,7 +270,8 @@ class ArrayObject(ArrayBasic):
         return self._pname
 
     # Pickling support
-    _pickle_kwargs = ArrayBasic._pickle_kwargs + ['fields']
+    _pickle_kwargs = ArrayBasic._pickle_kwargs + ['dimensions', 'fields']
+    _pickle_kwargs.remove('dtype')
 
 
 class PointerArray(ArrayBasic):
