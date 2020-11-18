@@ -156,7 +156,7 @@ class SharedData(ThreadArray):
 
     @cached_property
     def symbolic_base(self):
-        return self[self.dim].base.label
+        return Scalar(name=self.name, dtype=None)
 
     @cached_property
     def symbolic_id(self):
