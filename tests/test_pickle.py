@@ -14,7 +14,8 @@ from devito.mpi.routines import (MPIStatusObject, MPIMsgEnriched, MPIRequestObje
 from devito.operator.profiling import Timer
 from devito.types import (Array, CustomDimension, Symbol as dSymbol, Scalar,
                           PointerArray, Lock, STDThreadArray, SharedData)
-from devito.symbolics import IntDiv, ListInitializer, FunctionFromPointer, DefFunction
+from devito.symbolics import (IntDiv, ListInitializer, FieldFromPointer,
+                              FunctionFromPointer, DefFunction)
 from examples.seismic import (demo_model, AcquisitionGeometry,
                               TimeAxis, RickerSource, Receiver)
 
@@ -232,6 +233,13 @@ def test_shared_data():
     assert sdata.size == new_sdata.size
     assert sdata.fields == new_sdata.fields
     assert sdata.pfields == new_sdata.pfields
+
+    ffp = FieldFromPointer(sdata._field_flag, sdata.symbolic_base)
+
+    pkl_ffp = pickle.dumps(ffp)
+    new_ffp = pickle.loads(pkl_ffp)
+
+    assert ffp == new_ffp
 
 
 def test_receiver():
