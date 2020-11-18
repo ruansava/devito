@@ -6,9 +6,9 @@ import numpy as np
 
 from devito.data import FULL
 from devito.ir.equations import DummyEq
-from devito.ir.iet import (Call, Callable, Conditional, Expression, List, Iteration,
-                           PointerCast, SyncSpot, While, FindNodes, LocalExpression,
-                           Transformer, BlankLine, DummyExpr, derive_parameters)
+from devito.ir.iet import (Call, Callable, Conditional, List, Iteration, PointerCast,
+                           SyncSpot, While, FindNodes, LocalExpression, Transformer,
+                           BlankLine, DummyExpr, derive_parameters)
 from devito.ir.support import Forward
 from devito.passes.iet.engine import iet_pass
 from devito.symbolics import (CondEq, CondNe, FieldFromComposite, FieldFromPointer,
