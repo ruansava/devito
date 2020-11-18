@@ -135,7 +135,10 @@ class Orchestrator(object):
         return threadswait
 
     def __make_activate_thread(self, threads, sdata, sync_ops):
-        d = threads.index
+        if threads.size == 1:
+            d = threads.index
+        else:
+            d = Symbol(name=self.sregistry.make_name(prefix=threads.index.name))
 
         sync_locks = [s for s in sync_ops if s.is_SyncLock]
         condition = Or(*([CondNe(s.handle, 2) for s in sync_locks] +
@@ -144,9 +147,8 @@ class Orchestrator(object):
         if threads.size == 1:
             activation = [While(condition)]
         else:
-            sd = Symbol(name=d.name, dtype=np.int32)
-            activation = [DummyExpr(sd, 0),
-                          While(condition, DummyExpr(sd, (sd + 1) % threads.size))]
+            activation = [DummyExpr(d, 0),
+                          While(condition, DummyExpr(d, (d + 1) % threads.size))]
 
         activation.extend([DummyExpr(FieldFromComposite(i.name, sdata[d]), i)
                            for i in sdata.fields])
