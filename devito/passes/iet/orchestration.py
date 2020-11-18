@@ -189,10 +189,11 @@ class Orchestrator(object):
                 BlankLine,
                 List(header=self._P._map_update_wait_host(s.target, imask,
                                                           SharedData._field_id)),
-                DummyExpr(s.handle, 1),
-                BlankLine
+                DummyExpr(s.handle, 1)
             ]))
-            postactions.append(List(header=c.Line(), body=DummyExpr(s.handle, 2)))
+            postactions.append(DummyExpr(s.handle, 2))
+        preactions.append(BlankLine)
+        postactions.insert(0, BlankLine)
 
         # Turn `iet` into an ElementalFunction so that it can be
         # executed asynchronously by `threadhost`
