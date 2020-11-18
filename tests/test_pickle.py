@@ -241,6 +241,14 @@ def test_shared_data():
 
     assert ffp == new_ffp
 
+    indexed = sdata[0]
+
+    pkl_indexed = pickle.dumps(indexed)
+    new_indexed = pickle.loads(pkl_indexed)
+
+    assert indexed.name == new_indexed.name
+    assert indexed.shape == new_indexed.shape
+
 
 def test_receiver():
     grid = Grid(shape=(3,))
