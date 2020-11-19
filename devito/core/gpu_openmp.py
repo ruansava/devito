@@ -674,7 +674,8 @@ class DeviceOpenMPCustomOperator(CustomOperator, DeviceOpenMPOperator):
 
 def is_on_device(maybe_symbol, gpu_fit, only_writes=False):
     """
-    True if all Function's are allocated in the device memory, False otherwise.
+    True if all given Functions are allocated in the device memory, False otherwise.
+
     Parameters
     ----------
     maybe_symbol : Indexed or Function or Node
@@ -704,7 +705,7 @@ def is_on_device(maybe_symbol, gpu_fit, only_writes=False):
 
 def make_callbacks(options):
     """
-    Construction options-dependant callbacks used by various compiler passes.
+    Options-dependent callbacks used by various compiler passes.
     """
 
     def is_on_host(f):
