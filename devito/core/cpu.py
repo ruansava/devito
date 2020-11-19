@@ -390,7 +390,7 @@ class CustomOperator(CPU64Operator):
         'buffering',
         # Clusters
         'blocking', 'topofuse', 'fuse', 'factorize', 'cire-sops', 'cse',
-        'lift', 'opt-pows'
+        'lift', 'opt-pows',
         # IET
         'denormals', 'optcomms', 'openmp', 'mpi', 'simd', 'prodders',
     )
