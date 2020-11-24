@@ -282,22 +282,17 @@ class AdvisorProfiler(AdvancedProfiler):
         else:
             return iet
     '''
+
     def instrument(self, iet, timer):
         # Look for the presence of a time loop within the IET of the Operator
-        found = False
-        for node in FindNodes(Iteration).visit(iet):
-            if node.dim.is_Time:
-                found = True
-                break
-
-        if found:
-            # The calls to Advisor's Collection Control API are only for Operators with
-            # a time loop
+        nodes = FindNodes(Iteration).visit(iet)
+        if nodes:
             mapper = {}
-            mylist = List(header=c.Statement('%s()' % self._api_resume),
-                          body=iet,
-                          footer=c.Statement('%s()' % self._api_pause))
-            mapper[0] = mylist
+            for node in FindNodes(Iteration).visit(iet):
+                if node.dim.is_Time:
+                    mapper[node] =  List(header=c.Statement('%s()' % self._api_resume),
+                                         body=iet,
+                                         footer=c.Statement('%s()' % self._api_pause))
             return Transformer(mapper).visit(iet)
 
         return iet
