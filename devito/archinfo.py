@@ -63,7 +63,7 @@ def get_cpu_info():
                 pass
 
             try:
-                return cpuinfo.get_cpu_info().get('raw_arch_string')
+                return cpuinfo.get_cpu_info().get('arch').lower()
             except:
                 pass
 
@@ -80,7 +80,7 @@ def get_cpu_info():
 
     # Detect number of logical cores
     try:
-        if cpu_info['brand'] == 'aarch64':
+        if 'arm' in cpu_info['brand']:
             # In some ARM processors psutils and lscpu fail to detect cores correctly
             logical = psutil.cpu_count(logical=True)
             physical = psutil.cpu_count(logical=False)
@@ -323,7 +323,7 @@ def get_platform():
             return platform_registry['power8']
         elif 'power9' in brand:
             return platform_registry['power8']
-        elif 'arm' in brand or 'aarch64' in brand:
+        elif 'arm' in brand:
             return platform_registry['arm']
         elif 'amd' in brand:
             return platform_registry['amd']
