@@ -42,7 +42,7 @@ def get_cpu_info():
             try:
                 # ARM Thunder X2 is using 'Features' instead of 'flags'
                 flags = [i for i in lines if (i.startswith('Features')
-                         or i.startswith('flags'))][0]
+                                              or i.startswith('flags'))][0]
                 return flags.split(':')[1].strip().split()
             except:
                 return None
@@ -63,6 +63,7 @@ def get_cpu_info():
                 pass
 
             try:
+                # Certain ARM CPUs, e.g. Marvell Thunder X2
                 return cpuinfo.get_cpu_info().get('arch').lower()
             except:
                 pass
@@ -79,18 +80,14 @@ def get_cpu_info():
         pass
 
     # Detect number of logical cores
-    try:
-        if 'arm' in cpu_info['brand']:
-            # In some ARM processors psutils and lscpu fail to detect cores correctly
-            logical = psutil.cpu_count(logical=True)
-            physical = psutil.cpu_count(logical=False)
-            if physical != (lscpu()['Core(s) per socket'] * lscpu()['Socket(s)']):
-                physical = (lscpu()['Core(s) per socket'] * lscpu()['Socket(s)'])
-            cpu_info['logical'] = logical
-            cpu_info['physical'] = physical
-            return cpu_info
-    except:
-        pass
+    if 'arm' in cpu_info['brand']:
+        # In some ARM processors psutils fail to detect physical cores correctly
+        # so we use lscpu()
+        logical = psutil.cpu_count(logical=True)
+        physical = (lscpu()['Core(s) per socket'] * lscpu()['Socket(s)'])
+        cpu_info['logical'] = logical
+        cpu_info['physical'] = physical
+        return cpu_info
 
     logical = psutil.cpu_count(logical=True)
     if not logical:
