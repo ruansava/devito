@@ -32,7 +32,6 @@ def get_cpu_info():
 
     # Extract CPU flags and branch
     if lines:
-
         # The /proc/cpuinfo format doesn't follow a standard, and on some
         # more or less exotic combinations of OS and platform it might not
         # contain the information we look for, hence the proliferation of
@@ -45,7 +44,7 @@ def get_cpu_info():
                                               or i.startswith('flags'))][0]
                 return flags.split(':')[1].strip().split()
             except:
-                return None
+                pass
 
         def get_cpu_brand():
             try:
@@ -70,14 +69,9 @@ def get_cpu_info():
 
         cpu_info['flags'] = get_cpu_flags()
         cpu_info['brand'] = get_cpu_brand()
-
-    try:
-        if 'flags' not in cpu_info:
-            # Fallback
-            ci = cpuinfo.get_cpu_info()
-            cpu_info['flags'] = ci.get('flags')
-    except:
-        pass
+    else:
+        cpu_info['flags'] = cpuinfo.get_cpu_info().get('flags')
+        cpu_info['brand'] = cpuinfo.get_cpu_info().get('brand')
 
     # Detect number of logical cores
     try:
