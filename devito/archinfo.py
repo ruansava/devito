@@ -32,7 +32,6 @@ def get_cpu_info():
 
     # Extract CPU flags and branch
     if lines:
-
         # The /proc/cpuinfo format doesn't follow a standard, and on some
         # more or less exotic combinations of OS and platform it might not
         # contain the information we look for, hence the proliferation of
@@ -42,7 +41,7 @@ def get_cpu_info():
             try:
                 # ARM Thunder X2 is using 'Features' instead of 'flags'
                 flags = [i for i in lines if (i.startswith('Features')
-                         or i.startswith('flags'))][0]
+                                              or i.startswith('flags'))][0]
                 return flags.split(':')[1].strip().split()
             except:
                 return None
@@ -63,35 +62,33 @@ def get_cpu_info():
                 pass
 
             try:
-                return cpuinfo.get_cpu_info().get('raw_arch_string')
+                # Certain ARM CPUs, e.g. Marvell Thunder X2
+                return cpuinfo.get_cpu_info().get('arch').lower()
             except:
-                pass
+                return None
 
         cpu_info['flags'] = get_cpu_flags()
         cpu_info['brand'] = get_cpu_brand()
 
-    try:
-        if 'flags' not in cpu_info:
-            # Fallback
-            ci = cpuinfo.get_cpu_info()
-            cpu_info['flags'] = ci.get('flags')
-    except:
-        pass
+    if not cpu_info.get('flags'):
+        cpu_info['flags'] = cpuinfo.get_cpu_info().get('flags')
 
-    # Detect number of logical cores
+    if not cpu_info.get('brand'):
+        cpu_info['brand'] = cpuinfo.get_cpu_info().get('brand')
+
+    # Special case: in some ARM processors psutils fail to detect physical cores
+    # correctly so we use lscpu()
     try:
-        if cpu_info['brand'] == 'aarch64':
-            # In some ARM processors psutils and lscpu fail to detect cores correctly
+        if 'arm' in cpu_info['brand']:
             logical = psutil.cpu_count(logical=True)
-            physical = psutil.cpu_count(logical=False)
-            if physical != (lscpu()['Core(s) per socket'] * lscpu()['Socket(s)']):
-                physical = (lscpu()['Core(s) per socket'] * lscpu()['Socket(s)'])
+            physical = (lscpu()['Core(s) per socket'] * lscpu()['Socket(s)'])
             cpu_info['logical'] = logical
             cpu_info['physical'] = physical
             return cpu_info
     except:
         pass
 
+    # Detect number of logical cores
     logical = psutil.cpu_count(logical=True)
     if not logical:
         # Never bumped into a platform that make us end up here, yet
@@ -127,15 +124,12 @@ def get_cpu_info():
         # Fallback 1: it should now be fine to use psutil
         physical = psutil.cpu_count(logical=False)
         if not physical:
-            # Fallback 2: we might end up here
-            # on more exotic platforms such a Power8 or due to
-            # erroneous autodetection
+            # Fallback 2: we might end up here on more exotic platforms such as Power8
             try:
-                physical = (lscpu()['Core(s) per socket'] * lscpu()['Socket(s)'])
+                physical = lscpu()['Core(s) per socket'] * lscpu()['Socket(s)']
             except KeyError:
                 warning("Physical core count autodetection failed")
                 physical = 1
-
     cpu_info['physical'] = physical
     return cpu_info
 
@@ -279,7 +273,8 @@ def lscpu():
     if output:
         lines = output.decode("utf-8").strip().split('\n')
         mapper = {}
-        # Using split(':', 1) to avoid splitting lines with security issues
+        # Using split(':', 1) to avoid splitting lines where lscpu shows vulnerabilities
+        # on some CPUs: https://askubuntu.com/questions/1248273/lscpu-vulnerabilities
         for k, v in [tuple(i.split(':', 1)) for i in lines]:
             try:
                 mapper[k] = int(v)
@@ -323,7 +318,7 @@ def get_platform():
             return platform_registry['power8']
         elif 'power9' in brand:
             return platform_registry['power8']
-        elif 'arm' in brand or 'aarch64' in brand:
+        elif 'arm' in brand:
             return platform_registry['arm']
         elif 'amd' in brand:
             return platform_registry['amd']
