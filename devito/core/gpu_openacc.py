@@ -30,36 +30,14 @@ class DeviceOpenACCIteration(DeviceOpenMPIteration):
         return 'acc parallel loop'
 
     @classmethod
-    def _make_clauses(cls, ncollapse=None, chunk_size=None, nthreads=None,
-                      reduction=None, schedule=None, **kwargs):
-        clauses = []
+    def _make_clauses(cls, **kwargs):
+        kwargs['chunk_size'] = False
+        clauses = super(DeviceOpenACCIteration, cls)._make_clauses(**kwargs)
 
-        clauses.append('collapse(%d)' % (ncollapse or 1))
-
-        if chunk_size is not False:
-            clauses.append('schedule(%s,%s)' % (schedule or 'dynamic',
-                                                chunk_size or 1))
-
-        if nthreads:
-            clauses.append('num_threads(%s)' % nthreads)
-
-        if reduction:
-            args = []
-            for i in reduction:
-                if i.is_Indexed:
-                    f = i.function
-                    bounds = []
-                    for k, d in zip(i.indices, f.dimensions):
-                        if k.is_Number:
-                            bounds.append('[%s]' % k)
-                        else:
-                            # OpenMP expects a range as input of reduction,
-                            # such as reduction(+:f[0:f_vec->size[1]])
-                            bounds.append('[0:%s]' % f._C_get_field(FULL, d).size)
-                    args.append('%s%s' % (i.name, ''.join(bounds)))
-                else:
-                    args.append(str(i))
-            clauses.append('reduction(+:%s)' % ','.join(args))
+        partree = kwargs['nodes']
+        deviceptrs = [i.name for i in FindSymbols().visit(partree) if i.is_Array]
+        if deviceptrs:
+            clauses.append("deviceptr(%s)" % ",".join(deviceptrs))
 
         return clauses
 
