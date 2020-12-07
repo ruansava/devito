@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 
 from devito import (Grid, TimeFunction, SparseTimeFunction, Function, Operator, Eq,
-                    configuration)
+                    SubDomain, configuration)
 from devito.ir import FindSymbols, retrieve_iteration_tree
 from devito.passes.equations.linearity import _is_const_coeff
 from devito.tools import timed_region
@@ -177,3 +177,33 @@ class TestBuffering(object):
         op1.apply(time_M=nt-2, u=u1)
 
         assert np.all(u.data == u1.data)
+
+    def test_over_one_subdomain(self):
+
+        class sd0(SubDomain):
+            name = 'd0'
+
+            def define(self, dimensions):
+                x, y = dimensions
+                return {x: ('middle', 3, 3), y: ('middle', 3, 3)}
+
+        s_d0 = sd0()
+        nt = 10
+        grid = Grid(shape=(10, 10), subdomains=(s_d0,))
+
+        u = TimeFunction(name="u", grid=grid, save=nt)
+        u1 = TimeFunction(name="u", grid=grid, save=nt)
+        v = TimeFunction(name='v', grid=grid)
+        v1 = TimeFunction(name='v', grid=grid)
+
+        eqns = [Eq(v.forward, v + 1, subdomain=s_d0),
+                Eq(u, v, subdomain=s_d0)]
+
+        op0 = Operator(eqns, opt='noop')
+        op1 = Operator(eqns, opt='buffering')
+
+        op0.apply(time_M=nt-2)
+        op1.apply(time_M=nt-2, u=u1, v=v1)
+
+        assert np.all(u.data == u1.data)
+        assert np.all(v.data == v1.data)

@@ -6,7 +6,7 @@ from devito.logger import warning
 from devito.symbolics import retrieve_function_carriers, uxreplace
 from devito.tools import (Bunch, DefaultOrderedDict, as_tuple, filter_ordered, flatten,
                           timed_pass)
-from devito.types import Array, CustomDimension, Eq, SteppingDimension
+from devito.types import Array, CustomDimension, Dimension, Eq, SteppingDimension
 
 __all__ = ['buffering']
 
@@ -103,9 +103,11 @@ def _buffering(expressions, callback, options):
         buffers.append(Buffer(f, dims, accessv, n, async_degree))
 
     # Create Eqs to initialize buffers. Note: a buffer needs to be initialized
-    # only if the buffered Function is read in at least one place
+    # only if the buffered Function is read in at least one place or in the case
+    # of non-uniform SubDimensions, to avoid uninitialized values to be copied-back
+    # into the buffered Function
     processed = [Eq(b.indexify(), b.function.subs(b.contraction_mapper))
-                 for b in buffers if b.is_read]
+                 for b in buffers if b.is_read or not b.has_uniform_subdims]
 
     # Substitution rules to replace buffered Functions with buffers
     subs = {}
@@ -123,7 +125,10 @@ def _buffering(expressions, callback, options):
                 items = list(zip(e.lhs.indices, b.function.dimensions))
                 lhs = b.function[[i if i in b.index_mapper else d for i, d in items]]
                 rhs = b.indexed[[b.index_mapper.get(i, d) for i, d in items]]
-                processed.append(Eq(lhs, rhs))
+                if b.subdims_mapper:
+                    processed.append(uxreplace(Eq(lhs, rhs), b.subdims_mapper))
+                else:
+                    processed.append(Eq(lhs, rhs))
                 break
 
     return processed
@@ -188,6 +193,28 @@ class Buffer(object):
         self.contraction_mapper = contraction_mapper
         self.index_mapper = index_mapper
 
+        # Track the SubDimensions used to index into `function`
+        subdims_mapper = DefaultOrderedDict(list)
+        for e in accessv.mapper:
+            try:
+                # Case 1: implicitly via SubDomains
+                for d, v in e.subdomain.dimension_map.items():
+                    subdims_mapper[d.root].append(v)
+            except AttributeError:
+                # Case 2: explicitly via the lower-level SubDimension API
+                for i in e.free_symbols:
+                    if not isinstance(i, Dimension):
+                        continue
+                    elif not i.is_Derived:
+                        subdims_mapper[i].append(i)
+                    elif i.is_Sub:
+                        subdims_mapper[i.root].append(i)
+        if any(len(v) > 1 for v in subdims_mapper.values()):
+            # Non-uniform SubDimensions
+            self.subdims_mapper = None
+        else:
+            self.subdims_mapper = {d: v.pop() for d, v in subdims_mapper.items()}
+
         self.buffer = Array(name='%sb' % function.name,
                             dimensions=dims,
                             dtype=function.dtype,
@@ -207,6 +234,10 @@ class Buffer(object):
     @property
     def lastwrite(self):
         return self.accessv.lastwrite
+
+    @property
+    def has_uniform_subdims(self):
+        return self.subdims_mapper is not None
 
     @cached_property
     def indexed(self):
