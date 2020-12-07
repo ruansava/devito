@@ -1,7 +1,9 @@
 from collections import OrderedDict
+from itertools import combinations
 
 from cached_property import cached_property
 
+from devito.exceptions import InvalidOperator
 from devito.logger import warning
 from devito.symbolics import retrieve_function_carriers, uxreplace
 from devito.tools import (Bunch, DefaultOrderedDict, as_tuple, filter_ordered, flatten,
@@ -194,24 +196,30 @@ class Buffer(object):
         self.index_mapper = index_mapper
 
         # Track the SubDimensions used to index into `function`
-        subdims_mapper = DefaultOrderedDict(list)
+        subdims_mapper = DefaultOrderedDict(set)
         for e in accessv.mapper:
             try:
                 # Case 1: implicitly via SubDomains
-                for d, v in e.subdomain.dimension_map.items():
-                    subdims_mapper[d.root].append(v)
+                m = {d.root: v for d, v in e.subdomain.dimension_map.items()}
             except AttributeError:
                 # Case 2: explicitly via the lower-level SubDimension API
-                for i in e.free_symbols:
-                    if not isinstance(i, Dimension):
-                        continue
-                    elif not i.is_Derived:
-                        subdims_mapper[i].append(i)
-                    elif i.is_Sub:
-                        subdims_mapper[i.root].append(i)
+                m = {i.root: i for i in e.free_symbols
+                     if isinstance(i, Dimension) and (i.is_Sub or not i.is_Derived)}
+            for d, v in m.items():
+                subdims_mapper[d].add(v)
         if any(len(v) > 1 for v in subdims_mapper.values()):
-            # Non-uniform SubDimensions
+            # Non-uniform SubDimensions. At this point we're going to raise
+            # an exception. It's either illegal or still unsupported
+            for v in subdims_mapper.values():
+                for d0, d1 in combinations(v, 2):
+                    if d0.overlap(d1):
+                        raise InvalidOperator("Cannot apply `buffering` to `%s` as it "
+                                              "is accessed over the overlapping "
+                                              " SubDimensions `<%s, %s>`" %
+                                              (function, d0, d1))
             self.subdims_mapper = None
+            raise NotImplementedError("`buffering` does not support multiple "
+                                      "non-overlapping SubDimensions yet.")
         else:
             self.subdims_mapper = {d: v.pop() for d, v in subdims_mapper.items()}
 
