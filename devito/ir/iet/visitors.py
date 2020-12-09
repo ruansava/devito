@@ -818,6 +818,10 @@ class XSubs(Transformer):
         body = self._visit(o.body)
         return o._rebuild(sync_ops=sync_ops, body=body)
 
+    def visit_HaloSpot(self, o):
+        print("IN XSUBS.VISIT_HALOSPOTS")
+        from IPython import embed; embed()
+
     def visit_Expression(self, o):
         return o._rebuild(expr=self.replacer(o.expr))
 

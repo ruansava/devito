@@ -1,11 +1,14 @@
 from collections import OrderedDict
 
+import numpy as np
+
+from devito.exceptions import InvalidOperator
 from devito.ir.iet import (Expression, Increment, Iteration, List, Conditional, SyncSpot,
                            Section, HaloSpot, ExpressionBundle, FindNodes, FindSymbols,
                            XSubs, Transformer)
-from devito.symbolics import IntDiv, xreplace_indices
-from devito.tools import as_mapper, timed_pass
-from devito.types import ConditionalDimension
+from devito.symbolics import IntDiv, uxreplace, xreplace_indices
+from devito.tools import DefaultOrderedDict, as_mapper, is_integer, flatten, timed_pass
+from devito.types import ConditionalDimension, ModuloDimension
 
 __all__ = ['iet_build', 'iet_lower_dims']
 
@@ -61,8 +64,8 @@ def iet_lower_dims(iet):
 
 def _lower_stepping_dims(iet):
     """
-    Lower SteppingDimensions: index functions involving SteppingDimensions are
-    turned into ModuloDimensions.
+    Lower SteppingDimensions by turning index functions involving
+    SteppingDimensions into ModuloDimensions.
 
     Examples
     --------
@@ -72,6 +75,62 @@ def _lower_stepping_dims(iet):
 
     u[t1, x] = u[t0, x] + 1
     """
+    # Replace SteppingDimensions with ModuloDimensions in each Iteration header
+    subs = {}
+    for iteration in FindNodes(Iteration).visit(iet):
+        steppers = {d for d in iteration.uindices if d.is_Stepping}
+        if not steppers:
+            continue
+        d = iteration.dim
+
+        exprs = FindNodes(Expression).visit(iteration)
+        symbols = flatten(e.free_symbols for e in exprs)
+        indexeds = [i for i in symbols if i.is_Indexed]
+
+        mapper = DefaultOrderedDict(lambda: DefaultOrderedDict(set))
+        for indexed in indexeds:
+            try:
+                iaf = indexed.indices[d]
+            except KeyError:
+                continue
+
+            # Sanity checks
+            sis = iaf.free_symbols & steppers
+            if len(sis) == 0:
+                continue
+            elif len(sis) == 1:
+                si = sis.pop()
+            else:
+                raise InvalidOperator("Cannot use multiple SteppingDimensions "
+                                      "to index into a Function")
+            size = indexed.function.shape_allocated[d]
+            assert is_integer(size)
+
+            mapper[size][si].add(iaf)
+
+        if not mapper:
+            continue
+
+        mds = []
+        for size, v in mapper.items():
+            for si, iafs in v.items():
+                # Offsets are sorted so that the semantic order (t0, t1, t2) follows
+                # SymPy's index ordering (t, t-1, t+1) afer modulo replacement so
+                # that associativity errors are consistent. This corresponds to
+                # sorting offsets {-1, 0, 1} as {0, -1, 1} assigning -inf to 0
+                siafs = sorted(iafs, key=lambda i: -np.inf if i - si == 0 else (i - si))
+
+                for iaf in siafs:
+                    name = '%s%d' % (si.name, len(mds))
+                    offset = uxreplace(iaf, {si: d.root})
+                    mds.append(ModuloDimension(name, si, offset, size, origin=iaf))
+
+        uindices = mds + [i for i in iteration.uindices if i not in steppers]
+        subs[iteration] = iteration._rebuild(uindices=uindices)
+
+    if subs:
+        iet = Transformer(subs, nested=True).visit(iet)
+
     subs = {}
     for i in FindNodes(Iteration).visit(iet):
         if not i.uindices:
@@ -107,8 +166,8 @@ def _lower_stepping_dims(iet):
 
 def _lower_conditional_dims(iet):
     """
-    Lower ConditionalDimensions: index functions involving ConditionalDimensions
-    are turned into integer-division expressions.
+    Lower ConditionalDimensions by turning index functions involving
+    ConditionalDimensions into integer-division expressions.
 
     Examples
     --------
