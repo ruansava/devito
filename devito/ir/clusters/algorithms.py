@@ -9,7 +9,7 @@ from devito.ir.clusters.analysis import analyze
 from devito.ir.clusters.cluster import Cluster, ClusterGroup
 from devito.ir.clusters.queue import Queue, QueueStateful
 from devito.symbolics import uxreplace
-from devito.tools import DefaultOrderedDict, is_integer, timed_pass
+from devito.tools import DefaultOrderedDict, flatten, is_integer, timed_pass
 from devito.types import ModuloDimension
 
 __all__ = ['clusterize']
@@ -212,7 +212,8 @@ class Stepper(Queue):
 
         d = prefix[-1].dim
 
-        subiters = set().union(*[c.ispace.sub_iterators.get(d, []) for c in clusters])
+        subiters = flatten([c.ispace.sub_iterators.get(d, []) for c in clusters])
+        subiters = {i for i in subiters if i.is_Stepping}
         if not subiters:
             return clusters
 
