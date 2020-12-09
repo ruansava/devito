@@ -53,56 +53,9 @@ def iet_lower_dims(iet):
     """
     Lower the DerivedDimensions in ``iet``.
     """
-    iet = _lower_stepping_dims(iet)
     iet = _lower_conditional_dims(iet)
 
     return iet
-
-
-def _lower_stepping_dims(iet):
-    """
-    Lower SteppingDimensions: index functions involving SteppingDimensions are
-    turned into ModuloDimensions.
-
-    Examples
-    --------
-    u[t+1, x] = u[t, x] + 1
-
-    becomes
-
-    u[t1, x] = u[t0, x] + 1
-    """
-    subs = {}
-    for i in FindNodes(Iteration).visit(iet):
-        if not i.uindices:
-            # Be quick: avoid uselessy reconstructing nodes
-            continue
-
-        # In an expression, there could be `u[t+1, ...]` and `v[t+1, ...]`, where
-        # `u` and `v` are TimeFunction with circular time buffers (save=None) *but*
-        # different modulo extent. The `t+1` indices above are therefore conceptually
-        # different, so they will be replaced with the proper ModuloDimension through
-        # two different calls to `xreplace`
-        mindices = [d for d in i.uindices if d.is_Modulo]
-        groups = as_mapper(mindices, lambda d: d.modulo)
-        root = i
-        for k, v in groups.items():
-            mapper = {d.origin: d for d in v}
-
-            def rule(e):
-                f = e.function
-                if not (f.is_TimeFunction or f.is_Array):
-                    return False
-                try:
-                    return f.shape_allocated[i.dim] == k
-                except KeyError:
-                    return False
-
-            replacer = lambda e: xreplace_indices(e, mapper, rule)
-            root = XSubs(replacer=replacer).visit(root)
-        subs[i] = root
-
-    return Transformer(subs).visit(iet)
 
 
 def _lower_conditional_dims(iet):

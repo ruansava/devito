@@ -964,7 +964,10 @@ class Group(tuple):
                 hsize = sum(f._size_halo[l])
 
                 # Any `ofs`'s shift due to non-[0,0] iteration space
-                lower, upper = c.shifts[l].offsets
+                try:
+                    lower, upper = c.shifts[l].offsets
+                except AttributeError:
+                    lower, upper = c.shifts[l.root].offsets
 
                 try:
                     # Assume `ofs[d]` is a number (typical case)

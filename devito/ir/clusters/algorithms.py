@@ -8,8 +8,8 @@ from devito.ir.support import Any, Backward, Forward, IterationSpace
 from devito.ir.clusters.analysis import analyze
 from devito.ir.clusters.cluster import Cluster, ClusterGroup
 from devito.ir.clusters.queue import Queue, QueueStateful
-from devito.symbolics import uxreplace
-from devito.tools import DefaultOrderedDict, flatten, is_integer, timed_pass
+from devito.symbolics import uxreplace, xreplace_indices
+from devito.tools import DefaultOrderedDict, as_mapper, flatten, is_integer, timed_pass
 from devito.types import ModuloDimension
 
 __all__ = ['clusterize']
@@ -28,11 +28,11 @@ def clusterize(exprs):
     # Handle ConditionalDimensions
     clusters = guard(clusters)
 
-    # Handle SteppingDimensions
-    clusters = Stepper().process(clusters)
-
     # Determine relevant computational properties (e.g., parallelism)
     clusters = analyze(clusters)
+
+    # Handle SteppingDimensions
+    clusters = Stepper().process(clusters)
 
     return ClusterGroup(clusters)
 
@@ -258,12 +258,37 @@ class Stepper(Queue):
                     offset = uxreplace(iaf, {si: d.root})
                     mds.append(ModuloDimension(name, si, offset, size, origin=iaf))
 
-        # Reconstruct Clusters with augmented IterationSpace
+        # Reconstruct Clusters
         processed = []
         for c in clusters:
+            # Apply substitutions to the expressions
+            # Note: In an expression, there could be `u[t+1, ...]` and `v[t+1,
+            # ...]`, where `u` and `v` are TimeFunction with circular time
+            # buffers (save=None) *but* different modulo extent. The `t+1`
+            # indices above are therefore conceptually different, so they will
+            # be replaced with the proper ModuloDimension through two different
+            # calls to `xreplace`
+            exprs = c.exprs
+            groups = as_mapper(mds, lambda d: d.modulo)
+            for size, mds in groups.items():
+                mapper = {md.origin: md for md in mds}
+
+                def rule(e):
+                    f = e.function
+                    if not (f.is_TimeFunction or f.is_Array):
+                        return False
+                    try:
+                        return f.shape_allocated[d] == size
+                    except KeyError:
+                        return False
+
+                exprs = xreplace_indices(exprs, mapper, rule)
+
+            # Augment IterationSpace
             ispace = IterationSpace(c.ispace.intervals,
                                     {**c.ispace.sub_iterators, **{d: tuple(mds)}},
                                     c.ispace.directions)
-            processed.append(c.rebuild(ispace=ispace))
+
+            processed.append(c.rebuild(exprs=exprs, ispace=ispace))
 
         return processed
