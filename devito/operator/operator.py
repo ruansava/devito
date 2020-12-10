@@ -11,7 +11,7 @@ from devito.compiler import compiler_registry
 from devito.exceptions import InvalidOperator
 from devito.logger import info, perf, warning, is_log_enabled_for
 from devito.ir.equations import LoweredEq, lower_exprs, generate_implicit_exprs
-from devito.ir.clusters import ClusterGroup, clusterize, lower_dimensions
+from devito.ir.clusters import ClusterGroup, clusterize
 from devito.ir.iet import Callable, MetaCall, derive_parameters, iet_build
 from devito.ir.stree import stree_build
 from devito.operator.profiling import create_profile
@@ -330,9 +330,6 @@ class Operator(Callable):
         # Operation count after specialization
         final_ops = sum(estimate_cost(c.exprs) for c in clusters if c.is_dense)
         profiler.record_ops_variation(init_ops, final_ops)
-
-        # Lower all DerivedDimensions
-        clusters = lower_dimensions(clusters)
 
         return ClusterGroup(clusters)
 

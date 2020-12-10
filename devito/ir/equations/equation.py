@@ -82,6 +82,16 @@ class IREq(object):
     def state(self):
         return {i: getattr(self, i) for i in self._state}
 
+    def apply(self, func):
+        """
+        Apply a callable to `self` and each expr-like attribute carried by `self`,
+        thus triggering a reconstruction.
+        """
+        args = [func(self.lhs), func(self.rhs)]
+        kwargs = dict(self.state)
+        kwargs['conditionals'] = {k: func(v) for k, v in self.conditionals.items()}
+        return self.func(*args, **kwargs)
+
 
 class LoweredEq(sympy.Eq, IREq):
 
