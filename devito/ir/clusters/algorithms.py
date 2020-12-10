@@ -1,3 +1,4 @@
+from functools import partial
 from itertools import groupby
 
 import numpy as np
@@ -12,7 +13,7 @@ from devito.symbolics import uxreplace, xreplace_indices
 from devito.tools import DefaultOrderedDict, as_mapper, flatten, is_integer, timed_pass
 from devito.types import ModuloDimension
 
-__all__ = ['clusterize']
+__all__ = ['clusterize', 'lower_dimensions']
 
 
 def clusterize(exprs):
@@ -30,9 +31,6 @@ def clusterize(exprs):
 
     # Determine relevant computational properties (e.g., parallelism)
     clusters = analyze(clusters)
-
-    # Handle SteppingDimensions
-    clusters = Stepper().process(clusters)
 
     return ClusterGroup(clusters)
 
@@ -195,6 +193,14 @@ def guard(clusters):
     return ClusterGroup(processed)
 
 
+@timed_pass()
+def lower_dimensions(clusters):
+    # Handle SteppingDimensions
+    clusters = Stepper().process(clusters)
+
+    return clusters
+
+
 class Stepper(Queue):
 
     """
@@ -202,7 +208,6 @@ class Stepper(Queue):
     sub-iterators induced by a SteppingDimension.
     """
 
-    @timed_pass(name='stepping')
     def process(self, clusters):
         return self._process_fdta(clusters, 1)
 
@@ -243,7 +248,7 @@ class Stepper(Queue):
 
                 mapper[size][si].add(iaf)
 
-        # Construct the unique ModuloDimensions
+        # Construct the ModuloDimensions
         mds = []
         for size, v in mapper.items():
             for si, iafs in list(v.items()):
@@ -258,37 +263,43 @@ class Stepper(Queue):
                     offset = uxreplace(iaf, {si: d.root})
                     mds.append(ModuloDimension(name, si, offset, size, origin=iaf))
 
-        # Reconstruct Clusters
+        # Replacement rule for ModuloDimensions
+        def _rule(size, e):
+            try:
+                return e.function.shape_allocated[d] == size
+            except (AttributeError, KeyError):
+                return False
+
+        # Reconstruct the Clusters
         processed = []
         for c in clusters:
-            # Apply substitutions to the expressions
+            # Apply substitutions to expressions and guards
+            exprs = c.exprs
+            guards = c.guards
+            syncs = c.syncs
             # Note: In an expression, there could be `u[t+1, ...]` and `v[t+1,
             # ...]`, where `u` and `v` are TimeFunction with circular time
             # buffers (save=None) *but* different modulo extent. The `t+1`
             # indices above are therefore conceptually different, so they will
             # be replaced with the proper ModuloDimension through two different
-            # calls to `xreplace`
-            exprs = c.exprs
+            # calls to `xreplace_indices`
             groups = as_mapper(mds, lambda d: d.modulo)
-            for size, mds in groups.items():
-                mapper = {md.origin: md for md in mds}
+            for size, v in groups.items():
+                mapper = {md.origin: md for md in v}
 
-                def rule(e):
-                    f = e.function
-                    if not (f.is_TimeFunction or f.is_Array):
-                        return False
-                    try:
-                        return f.shape_allocated[d] == size
-                    except KeyError:
-                        return False
-
+                rule = partial(_rule, size)
                 exprs = xreplace_indices(exprs, mapper, rule)
+                guards = {k: xreplace_indices(e, mapper, rule) for k, e in guards.items()}
+
+                func = partial(xreplace_indices, mapper=mapper, key=rule)
+                syncs = {k: [i.subs(func) for i in s] for k, s in syncs.items()}
 
             # Augment IterationSpace
             ispace = IterationSpace(c.ispace.intervals,
                                     {**c.ispace.sub_iterators, **{d: tuple(mds)}},
                                     c.ispace.directions)
 
-            processed.append(c.rebuild(exprs=exprs, ispace=ispace))
+            processed.append(c.rebuild(exprs=exprs, ispace=ispace, guards=guards,
+                                       syncs=syncs))
 
         return processed

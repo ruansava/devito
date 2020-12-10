@@ -6,7 +6,7 @@ from devito.finite_differences.differentiable import diff2sympy
 from devito.ir.support import (IterationSpace, DataSpace, Interval, IntervalGroup,
                                Stencil, detect_accesses, detect_oobs, detect_io,
                                build_intervals, build_iterators)
-from devito.symbolics import CondEq
+from devito.symbolics import CondEq, IntDiv, uxreplace
 from devito.tools import Pickable, frozendict
 from devito.types import Eq
 
@@ -158,13 +158,15 @@ class LoweredEq(sympy.Eq, IREq):
                  for k, v in mapper.items() if k}
         dspace = DataSpace(dintervals, parts)
 
-        # Construct the conditionals
+        # Construct the conditionals and replace the ConditionalDimensions in `expr`
         conditionals = {}
         for d in conditional_dimensions:
             if d.condition is None:
                 conditionals[d] = CondEq(d.parent % d.factor, 0)
             else:
                 conditionals[d] = diff2sympy(lower_exprs(d.condition))
+            if d.factor is not None:
+                expr = uxreplace(expr, {d: IntDiv(d.index, d.factor)})
         conditionals = frozendict(conditionals)
 
         # Lower all Differentiable operations into SymPy operations

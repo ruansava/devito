@@ -236,6 +236,13 @@ class SyncOp(sympy.Expr, Pickable):
     def __eq__(self, other):
         return type(self) == type(other) and self.args == other.args
 
+    def subs(self, func):
+        """
+        A SyncOp ovverrides `subs` turning it into a higher-order method. The
+        subs isn't applied to `self` itself, but rather to some of its attributes.
+        """
+        return self
+
     # Pickling support
     _pickle_args = ['handle']
     __reduce_ex__ = Pickable.__reduce_ex__
@@ -253,6 +260,9 @@ class SyncLock(SyncOp):
     def target(self):
         return self.lock.target
 
+    def subs(self, func):
+        return self.func(func(self.handle))
+
 
 class SyncData(SyncOp):
 
@@ -262,6 +272,7 @@ class SyncData(SyncOp):
         obj = sympy.Expr.__new__(cls, function, dim, fetch, size, direction)
         obj.function = function
         obj.dim = dim
+        #TODO: SANITY CHECK THERE ARE NO STEPPING DIMENSIONS HERE??
         obj.fetch = fetch
         obj.size = size
         obj.direction = direction
@@ -278,6 +289,10 @@ class SyncData(SyncOp):
     @property
     def dimensions(self):
         return self.function.dimensions
+
+    def subs(self, func):
+        return self.func(self.function, self.dim, func(self.fetch), self.size,
+                         self.direction)
 
     # Pickling support
     _pickle_args = ['function', 'dim', 'fetch', 'size', 'direction']
