@@ -42,7 +42,7 @@ jobs:
           arch: "clang"
           platform: "nvidiaX"
           language: "openmp"
-          tags: ["self-hosted", "gpu", "openmp"]
+          tags: ["self-hosted", "rhodrin"]
 
         #- name: pytest-gpu-acc
           #test_file: "tests/test_gpu_openacc.py"
