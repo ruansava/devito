@@ -1,18 +1,19 @@
 # Runner information:
-# Standard NC24_Promo (24 vcpus, 224 GiB memory)
-# NVIDIA Tesla K80, Intel Xeon E5-2690 v3 (Haswell)
+# ACCA-Beast (12 cpus, 32 GiB memory)
+# NVIDIA GeForce GTX 960, Intel(R) Core(TM) i7-5930K CPU @ 3.50GHz
 
 name: CI-gpu
 
-on:
-  # Trigger the workflow on push or pull request,
-  # but only for the master branch
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+#on:
+  ## Trigger the workflow on push or pull request,
+  ## but only for the master branch
+  #push:
+    #branches:
+      #- master
+  #pull_request:
+    #branches:
+      #- master
+on: push
 
 jobs:
   build:
@@ -20,9 +21,9 @@ jobs:
     runs-on: ${{ matrix.tags }}
 
     env:
-      DEVITO_ARCH: ${{ matrix.arch }}
-      DEVITO_PLATFORM: ${{ matrix.platform }}
-      DEVITO_LANGUAGE: ${{ matrix.language }}
+      #DEVITO_ARCH: ${{ matrix.arch }}
+      #DEVITO_PLATFORM: ${{ matrix.platform }}
+      #DEVITO_LANGUAGE: ${{ matrix.language }}
       OMPI_CC: ${{ matrix.arch }}
 
     strategy:
@@ -31,8 +32,9 @@ jobs:
 
       matrix:
         name: [
-          pytest-gpu-omp,
-          pytest-gpu-acc
+          pytest-gpu-omp
+          #pytest-gpu-omp,
+          #pytest-gpu-acc
         ]
         include:
         - name: pytest-gpu-omp
@@ -42,12 +44,12 @@ jobs:
           language: "openmp"
           tags: ["self-hosted", "gpu", "openmp"]
 
-        - name: pytest-gpu-acc
-          test_file: "tests/test_gpu_openacc.py"
-          arch: "pgcc"
-          platform: "nvidiaX"
-          language: "openacc"
-          tags: ["self-hosted", "gpu", "openacc"]
+        #- name: pytest-gpu-acc
+          #test_file: "tests/test_gpu_openacc.py"
+          #arch: "pgcc"
+          #platform: "nvidiaX"
+          #language: "openacc"
+          #tags: ["self-hosted", "gpu", "openacc"]
 
     steps:
     - name: Checkout devito
@@ -55,18 +57,24 @@ jobs:
 
     - name: Install dependencies
       run: |
+        source ~/environments/openmp/bin/activate
+        source  ~/environments/scripts/openmp_env.sh
         pip3 install --upgrade pip
         pip3 install -e .[extras]
 
     - name: Test with pytest
       run: |
-        if [ "${{ matrix.name }}" == 'pytest-gpu-acc' ]; then
-          pgaccelinfo
-        fi
+        #if [ "${{ matrix.name }}" == 'pytest-gpu-acc' ]; then
+          #pgaccelinfo
+        #fi
+        source ~/environments/openmp/bin/activate
+        source  ~/environments/scripts/openmp_env.sh
         pytest --cov --cov-config=.coveragerc --cov-report=xml ${{ matrix.test_file }}
 
     - name: Test examples
       run: |
+        source ~/environments/openmp/bin/activate
+        source  ~/environments/scripts/openmp_env.sh
         pytest examples/seismic/acoustic/acoustic_example.py
         pytest examples/seismic/elastic/elastic_example.py
         pytest examples/seismic/tti/tti_example.py
@@ -75,14 +83,16 @@ jobs:
 
     - name: Test examples with MPI
       run: |
+        source ~/environments/openmp/bin/activate
+        source  ~/environments/scripts/openmp_env.sh
         DEVITO_MPI=1 mpirun -n 2 pytest examples/seismic/acoustic/acoustic_example.py
         DEVITO_MPI=1 mpirun -n 2 pytest examples/seismic/elastic/elastic_example.py
         DEVITO_MPI=1 mpirun -n 2 pytest examples/seismic/tti/tti_example.py
         DEVITO_MPI=1 mpirun -n 2 pytest examples/seismic/viscoacoustic/viscoacoustic_example.py
         DEVITO_MPI=1 mpirun -n 2 pytest examples/seismic/viscoelastic/viscoelastic_example.py
 
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v1.0.6
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
-        name: ${{ matrix.name }}
+    #- name: Upload coverage to Codecov
+      #uses: codecov/codecov-action@v1.0.6
+      #with:
+        #token: ${{ secrets.CODECOV_TOKEN }}
+        #name: ${{ matrix.name }}
